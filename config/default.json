@@ -1,0 +1,128 @@
+{
+  "Bitbucket": {
+    "BaseUrl": "",
+    "BotUsername": "carrot",
+    "Pat": ""
+  },
+  "BitbucketCloud": {
+    "Workspace": "",
+    "BotUsername": "",
+    "AccessToken": "",
+    "Email": ""
+  },
+  "Polling": {
+    "IntervalMs": 300000
+  },
+  "AuditPoller": {
+    "PollingIntervalMs": 300000
+  },
+  "Review": {
+    "MaxDiffLines": 5000,
+    "MaxFileLines": 1000,
+    "MaxInfoTokens": 8000,
+    "MaxReviewers": 2,
+    "MaxValidators": 2
+  },
+  "Model1": {
+    "Name": "Model1",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": true,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0,
+    "Review": false,
+    "Validate": true,
+    "Provider": "azure-openai-responses",
+    "DockerImage": "lgr-pi-runner:latest",
+    "TimeoutMs": 300000
+  },
+  "Model2": {
+    "Name": "Model2",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": true,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0,
+    "Review": false,
+    "Validate": true,
+    "Provider": "azure-openai-responses",
+    "DockerImage": "lgr-pi-runner:latest",
+    "TimeoutMs": 300000
+  },
+  "Model3": {
+    "Name": "Model3",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": true,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0,
+    "Review": false,
+    "Validate": true,
+    "Provider": "azure-openai-responses",
+    "DockerImage": "lgr-pi-runner:latest",
+    "TimeoutMs": 300000
+  },
+  "Model4": {
+    "Name": "Model4",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": true,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0,
+    "Review": false,
+    "Validate": true,
+    "Provider": "azure-openai-responses",
+    "DockerImage": "lgr-pi-runner:latest",
+    "TimeoutMs": 300000
+  },
+  "Diagnostics": {
+    "DebugLogs": false,
+    "Logging": {
+      "Console": {
+        "Enabled": true,
+        "Colors": true,
+        "LogData": false,
+        "MinLevel": 0,
+        "MaxLevel": 7
+      },
+      "Gelf": {
+        "Enabled": false,
+        "Host": "",
+        "Port": 0,
+        "TLS": {
+          "UseTLS": true,
+          "ClientCert": "",
+          "ClientKey": "",
+          "ServerCACert": ""
+        },
+        "MinLevel": 0,
+        "MaxLevel": 7
+      }
+    }
+  },
+  "WorkDir": "./repos",
+  "DataDir": "./data",
+  "Summarizer": {
+    "Name": "Summarizer",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": false,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0
+  }
+}

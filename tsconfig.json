@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "allowSyntheticDefaultImports": true,
+    "useUnknownInCatchVariables": false,
+    "module": "commonjs",
+    "declaration": true,
+    "removeComments": true,
+    "skipLibCheck": true,
+    "target": "es2017",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "incremental": true,
+    "noImplicitAny": true,
+    "strict": true,
+    "baseUrl": "./src",
+    "resolveJsonModule": true,
+    "paths": {},
+    "lib": ["ES2020.String"]
+  },
+  "exclude": ["node_modules"],
+  "include": ["src/**/*.ts", "config/**/*.json"]
+}

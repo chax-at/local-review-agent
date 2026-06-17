@@ -1,0 +1,117 @@
+{
+  "Bitbucket": {
+    "BaseUrl": "BITBUCKET_BASE_URL",
+    "BotUsername": "BITBUCKET_BOT_USERNAME",
+    "Pat": "BITBUCKET_PAT"
+  },
+  "BitbucketCloud": {
+    "Workspace": "BITBUCKET_CLOUD_WORKSPACE",
+    "BotUsername": "BITBUCKET_CLOUD_BOT_USERNAME",
+    "AccessToken": "BITBUCKET_CLOUD_ACCESS_TOKEN",
+    "Email": "BITBUCKET_CLOUD_BOT_EMAIL"
+  },
+  "Review": {
+    "MaxDiffLines": { "__name": "REVIEW_MAX_DIFF_LINES", "__format": "number" },
+    "MaxFileLines": { "__name": "REVIEW_MAX_FILE_LINES", "__format": "number" },
+    "MaxInfoTokens": { "__name": "REVIEW_MAX_INFO_TOKENS", "__format": "number" },
+    "MaxReviewers": { "__name": "REVIEW_MAX_REVIEWERS", "__format": "number" },
+    "MaxValidators": { "__name": "REVIEW_MAX_VALIDATORS", "__format": "number" }
+  },
+  "Model1": {
+    "ApiKey": "MODEL1_API_KEY",
+    "ApiBase": "MODEL1_API_BASE",
+    "Model": "MODEL1_MODEL",
+    "Name": "MODEL1_NAME",
+    "AuthHeader": "MODEL1_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "MODEL1_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "MODEL1_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "MODEL1_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "MODEL1_OUTPUT_COST", "__format": "number" },
+    "Review": { "__name": "MODEL1_REVIEW", "__format": "boolean" },
+    "Validate": { "__name": "MODEL1_VALIDATE", "__format": "boolean" },
+    "Provider": "MODEL1_PROVIDER",
+    "DockerImage": "MODEL1_DOCKER_IMAGE",
+    "TimeoutMs": { "__name": "MODEL1_TIMEOUT_MS", "__format": "number" }
+  },
+  "Model2": {
+    "ApiKey": "MODEL2_API_KEY",
+    "ApiBase": "MODEL2_API_BASE",
+    "Model": "MODEL2_MODEL",
+    "Name": "MODEL2_NAME",
+    "AuthHeader": "MODEL2_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "MODEL2_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "MODEL2_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "MODEL2_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "MODEL2_OUTPUT_COST", "__format": "number" },
+    "Review": { "__name": "MODEL2_REVIEW", "__format": "boolean" },
+    "Validate": { "__name": "MODEL2_VALIDATE", "__format": "boolean" },
+    "Provider": "MODEL2_PROVIDER",
+    "DockerImage": "MODEL2_DOCKER_IMAGE",
+    "TimeoutMs": { "__name": "MODEL2_TIMEOUT_MS", "__format": "number" }
+  },
+  "Model3": {
+    "ApiKey": "MODEL3_API_KEY",
+    "ApiBase": "MODEL3_API_BASE",
+    "Model": "MODEL3_MODEL",
+    "Name": "MODEL3_NAME",
+    "AuthHeader": "MODEL3_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "MODEL3_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "MODEL3_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "MODEL3_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "MODEL3_OUTPUT_COST", "__format": "number" },
+    "Review": { "__name": "MODEL3_REVIEW", "__format": "boolean" },
+    "Validate": { "__name": "MODEL3_VALIDATE", "__format": "boolean" },
+    "Provider": "MODEL3_PROVIDER",
+    "DockerImage": "MODEL3_DOCKER_IMAGE",
+    "TimeoutMs": { "__name": "MODEL3_TIMEOUT_MS", "__format": "number" }
+  },
+  "Model4": {
+    "ApiKey": "MODEL4_API_KEY",
+    "ApiBase": "MODEL4_API_BASE",
+    "Model": "MODEL4_MODEL",
+    "Name": "MODEL4_NAME",
+    "AuthHeader": "MODEL4_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "MODEL4_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "MODEL4_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "MODEL4_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "MODEL4_OUTPUT_COST", "__format": "number" },
+    "Review": { "__name": "MODEL4_REVIEW", "__format": "boolean" },
+    "Validate": { "__name": "MODEL4_VALIDATE", "__format": "boolean" },
+    "Provider": "MODEL4_PROVIDER",
+    "DockerImage": "MODEL4_DOCKER_IMAGE",
+    "TimeoutMs": { "__name": "MODEL4_TIMEOUT_MS", "__format": "number" }
+  },
+  "Diagnostics": {
+    "DebugLogs": {
+      "__name": "DIAGNOSTICS_DEBUG_LOGS",
+      "__format": "boolean"
+    },
+    "Logging": {
+      "Console": {
+        "Enabled": {
+          "__name": "DIAGNOSTICS_LOGGING_CONSOLE_ENABLED",
+          "__format": "boolean"
+        }
+      },
+      "Gelf": {
+        "Enabled": {
+          "__name": "DIAGNOSTICS_LOGGING_GELF_ENABLED",
+          "__format": "boolean"
+        },
+        "Host": "DIAGNOSTICS_LOGGING_GELF_HOST",
+        "Port": "DIAGNOSTICS_LOGGING_GELF_PORT"
+      }
+    }
+  },
+  "Summarizer": {
+    "ApiKey": "SUMMARIZER_API_KEY",
+    "ApiBase": "SUMMARIZER_API_BASE",
+    "Model": "SUMMARIZER_MODEL",
+    "Name": "SUMMARIZER_NAME",
+    "AuthHeader": "SUMMARIZER_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "SUMMARIZER_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "SUMMARIZER_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "SUMMARIZER_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "SUMMARIZER_OUTPUT_COST", "__format": "number" }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  // Per-repo configuration for the bot. Commit this as `.carrot.jsonc` on the
+  // repo's default branch to opt the repo in. All fields are optional.
+
+  // Directories containing package.json to audit (the bot runs npm audit in each).
+  "packages": [".", "frontend", "backend"],
+
+  // Enable AI PR code review (inline comments on new PRs).
+  "prReview": true,
+
+  // Enable audit-fix handling: when a build fails with npm audit issues, the bot
+  // analyzes the vulnerabilities and proposes fixes.
+  "bambooFix": true,
+
+  // How to deliver audit fixes:
+  //   "direct"         — push commit directly to the branch
+  //   "pr"             — always create a separate fix PR
+  //   "protected-only" — create a PR for protected branches, direct push otherwise
+  "fixDelivery": "protected-only",
+
+  // Branches considered protected (glob patterns).
+  // Used when fixDelivery is "protected-only".
+  "protectedBranches": ["main", "master", "release/*"]
+}

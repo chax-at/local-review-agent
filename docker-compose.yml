@@ -1,0 +1,30 @@
+---
+services:
+  # One-shot init: ensure volume dirs are writable by www-data (uid 33)
+  init-perms:
+    image: busybox
+    volumes:
+      - ./repos:/srv/www/app/repos
+      - ./data:/srv/www/app/data
+    command: sh -c "chown -R 33:33 /srv/www/app/data /srv/www/app/repos"
+    restart: "no"
+
+  local-git-reviewer:
+    image: "${image:-local-git-reviewer}:${tag:-latest}"
+    build:
+      dockerfile: Dockerfile
+      args:
+        from_registry: ${from_registry:-docker.io}
+        from_repository: ${from_repository:-library/node}
+        from_tag: ${from_tag:-24}
+    env_file: .env
+    environment:
+      NODE_ENV: production
+    volumes:
+      - ./repos:/srv/www/app/repos
+      - ./data:/srv/www/app/data
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 6m

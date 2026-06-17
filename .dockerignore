@@ -1,0 +1,13 @@
+# Keep the build context (and image layers) free of local-only and sensitive files.
+.git
+node_modules
+dist
+.env
+repos
+data
+*.log
+.idea
+.vscode
+.claude
+.mcp.json
+.worktrees

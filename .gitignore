@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.env
+config/local-development.json
+repos/
+data/
+*.log
+.idea/
+.worktrees/
+
+# Personal shell / git dotfiles that may sit in the working dir — never publish
+.bashrc
+.bash_profile
+.zshrc
+.zprofile
+.profile
+.gitconfig
+.ripgreprc
+
+# Local tooling / editor config — not part of the published project
+.claude/
+.mcp.json
+.vscode
+.gitmodules

@@ -1,0 +1,58 @@
+{
+  "name": "local-git-reviewer",
+  "version": "1.0.0",
+  "description": "A locally run PR reviewer for a local Bitbucket Server environment",
+  "license": "MIT",
+  "author": "chax.at",
+  "main": "dist/src/main-server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "ci:build": "npm ci --include=dev && npm run build && npm prune --production",
+    "ci:lint": "npm ci --include=dev && npm run lint",
+    "ci:typecheck": "tsc --noEmit",
+    "ci:test": "vitest run",
+    "start": "node dist/src/main-server.js",
+    "start:server": "node dist/src/main-server.js",
+    "start:cloud": "node dist/src/main-cloud.js",
+    "start:development": "concurrently --handle-input \"wait-on dist/src/main-server.js && nodemon dist/src/main-server.js\" \"tsc -w -p tsconfig.build.json\"",
+    "start:development:cloud": "concurrently --handle-input \"wait-on dist/src/main-cloud.js && nodemon dist/src/main-cloud.js\" \"tsc -w -p tsconfig.build.json\"",
+    "start:prod": "npm run start:production",
+    "start:production": "npm run start:server",
+    "lint": "eslint -c .eslintrc.js --ignore-path .eslintignore \"./src/**\"",
+    "ci:stylecheck": "prettier -c src",
+    "audit": "npx --yes @chax-at/better-npm-audit audit -l high -r https://registry.npmjs.org/",
+    "audit:autofix": "node ./tools/audit-autofix.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "reset:all": "ts-node tools/reset-state.ts all",
+    "reset:audit": "ts-node tools/reset-state.ts audit",
+    "reset:pr": "ts-node tools/reset-state.ts pr"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@chax-at/gelf-client": "^0.2.0",
+    "@chax-at/log-sink": "^0.2.0",
+    "config": "^3.3.9",
+    "cross-env": "^7.0.3",
+    "dotenv": "^17.3.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@chax-at/eslint-config": "^0.0.9",
+    "@types/config": "^3.3.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.2.1",
+    "concurrently": "^8.2.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-config-prettier": "^10.1.8",
+    "nodemon": "^3.0.1",
+    "prettier": "^3.8.1",
+    "ts-node": "^10.9.0",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^1.0.0",
+    "wait-on": "^7.0.1"
+  }
+}
