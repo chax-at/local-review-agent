@@ -2,6 +2,15 @@
 
 Automated PR reviewer and supply-chain security bot for Bitbucket Server / Data Center and Bitbucket Cloud. Reviews code with AI, monitors builds for audit vulnerabilities, and applies fixes. Configured per-repo via `.carrot.jsonc`.
 
+
+``` 
+CAUTION
+THIS IS VIBED
+Don't expect the quality in the code our company (chax.at) would usually deliver. This is vibed with love, but still vibed.
+However, it works really well, so feel free to use and change it on your behalf.
+```
+
+
 ## What it does
 
 1. **PR code review** — AI reviews every new PR and posts inline comments (severity, file, line)
