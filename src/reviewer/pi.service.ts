@@ -6,6 +6,7 @@ import { TraceTags } from '../log/tags';
 import type { IReviewFinding } from '../types';
 import { BOT_TEMP_DIR } from '../constants';
 import { ensurePiRunnerForBase } from './pi-runner-image';
+import { buildReviewPrompt, PERSONA_DIRECTIVES } from './personas';
 
 const SEVERITY_MAP: Record<string, IReviewFinding['severity']> = {
   error: 'concern',
@@ -312,6 +313,7 @@ export class PiService {
     codeStandards: string | null,
     existingComments: string | null,
     dockerImageOverride?: string,
+    personaDirective: string = PERSONA_DIRECTIVES.generic,
   ): IPiReviewResult {
     const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-'));
     try {
@@ -331,20 +333,7 @@ export class PiService {
         commentsArg = ' @/workspace/existing-comments.md';
       }
 
-      const promptLines = [
-        'Review this PR diff. Return a JSON object with a "findings" array.',
-        'Each finding must have: filePath (string), line (number), severity (concern|suggestion|note), comment (string).',
-        'Focus on: security issues, bugs, code standard violations.',
-        'Only review the diff, not surrounding code.',
-        'Ignore lock files (package-lock.json, yarn.lock, pnpm-lock.yaml, etc.) entirely.',
-        'If no issues found, return {"findings": []}.',
-      ];
-      if (commentsArg) {
-        promptLines.push(
-          "existing-comments.md lists comments already posted on these files. If a comment's issue is now addressed in the diff, do NOT re-raise it; only report what is still a real problem.",
-        );
-      }
-      const prompt = promptLines.join(' ');
+      const prompt = buildReviewPrompt(personaDirective, Boolean(commentsArg));
 
       const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --no-tools`;
       const script = this.buildBatchScript(piBase, standardsArg, commentsArg, prompt, diffs.length);
