@@ -29,6 +29,7 @@
     "OutputTokenCostPer1M": { "__name": "MODEL1_OUTPUT_COST", "__format": "number" },
     "Review": { "__name": "MODEL1_REVIEW", "__format": "boolean" },
     "Validate": { "__name": "MODEL1_VALIDATE", "__format": "boolean" },
+    "Roles": "MODEL1_ROLES",
     "Provider": "MODEL1_PROVIDER",
     "DockerImage": "MODEL1_DOCKER_IMAGE",
     "TimeoutMs": { "__name": "MODEL1_TIMEOUT_MS", "__format": "number" }
@@ -45,6 +46,7 @@
     "OutputTokenCostPer1M": { "__name": "MODEL2_OUTPUT_COST", "__format": "number" },
     "Review": { "__name": "MODEL2_REVIEW", "__format": "boolean" },
     "Validate": { "__name": "MODEL2_VALIDATE", "__format": "boolean" },
+    "Roles": "MODEL2_ROLES",
     "Provider": "MODEL2_PROVIDER",
     "DockerImage": "MODEL2_DOCKER_IMAGE",
     "TimeoutMs": { "__name": "MODEL2_TIMEOUT_MS", "__format": "number" }
@@ -61,6 +63,7 @@
     "OutputTokenCostPer1M": { "__name": "MODEL3_OUTPUT_COST", "__format": "number" },
     "Review": { "__name": "MODEL3_REVIEW", "__format": "boolean" },
     "Validate": { "__name": "MODEL3_VALIDATE", "__format": "boolean" },
+    "Roles": "MODEL3_ROLES",
     "Provider": "MODEL3_PROVIDER",
     "DockerImage": "MODEL3_DOCKER_IMAGE",
     "TimeoutMs": { "__name": "MODEL3_TIMEOUT_MS", "__format": "number" }
@@ -77,6 +80,7 @@
     "OutputTokenCostPer1M": { "__name": "MODEL4_OUTPUT_COST", "__format": "number" },
     "Review": { "__name": "MODEL4_REVIEW", "__format": "boolean" },
     "Validate": { "__name": "MODEL4_VALIDATE", "__format": "boolean" },
+    "Roles": "MODEL4_ROLES",
     "Provider": "MODEL4_PROVIDER",
     "DockerImage": "MODEL4_DOCKER_IMAGE",
     "TimeoutMs": { "__name": "MODEL4_TIMEOUT_MS", "__format": "number" }
