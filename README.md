@@ -50,7 +50,7 @@ cp .env.sample .env
 | `MODEL1_OUTPUT_COST` | Optional | Cost per 1M output tokens |
 | `MODEL1_REVIEW` | Optional | Set `true` to run the review pass (Docker pi-runner) with this model; the first review-enabled model also handles fix/propose/lint |
 | `MODEL1_VALIDATE` | Optional | Set `false` to exclude this model from the validator pool (defaults to `true`). Use for review-only deployments whose endpoint doesn't speak `/chat/completions` — e.g. Azure responses-API codex models — so the bot doesn't try to vote with them and 400. |
-| `MODEL1_PROVIDER` | When `MODEL1_REVIEW=true` | LLM provider identifier for the pi-runner (e.g. `azure-openai-responses`) |
+| `MODEL1_PROVIDER` | When `MODEL1_REVIEW=true` | pi-runner provider — must match the model. Supported: `anthropic`, `google` (Gemini), `openai`, `azure-openai-responses`, `openrouter`, `xai`, `deepseek`, `mistral`, `groq`. The key is forwarded to pi under that provider's env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, …). Defaults to `azure-openai-responses` — a Claude/Gemini model left on that default returns a 404. |
 | `MODEL1_DOCKER_IMAGE` | When `MODEL1_REVIEW=true` | Docker image for the pi-runner container (e.g. `lgr-pi-runner:latest`) |
 | `MODEL1_TIMEOUT_MS` | When `MODEL1_REVIEW=true` | Timeout in milliseconds for the pi-runner container |
 | `MODEL2_*` … `MODEL4_*` | Optional | Same fields for Model 2, 3, and 4 |
@@ -487,7 +487,7 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  1. clone/fetch + compute diff (origin/target...origin/source)       │
-│  2. review pass (≤MaxReviewers pi-runners), each shown the existing  │
+│  2. review pass (≤MaxReviewers×roles runs), each shown the existing  │
 │     PR comments so it won't re-raise addressed issues  → findings[]  │
 │  3. fetch whole files (provider API)                → contentByPath  │
 │  4. filter findings on files > MaxFileLines         → keptFindings[] │
@@ -508,7 +508,7 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 
 **Stage 1 — Clone/fetch + diff.** `GitService.cloneOrFetch` ensures the local repo is up to date; `GitService.getDiff` produces a three-dot diff against the merge base. If the diff is empty, the review aborts cleanly with no comment.
 
-**Stage 2 — Review pass.** Up to `REVIEW_MAX_REVIEWERS` models (default 2) from the `MODELn_REVIEW=true` pool run the pi-runner inside Docker against the diff and return their own list of findings (`{filePath, line, severity, comment}`). If more review models are configured than the cap allows, the active subset is **picked randomly per PR** — so different PRs may use different models, giving cost-bounded diversity. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. Findings are tagged with the authoring model. Findings on lockfiles are dropped automatically. If *all* active review models fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
+**Stage 2 — Review pass.** Up to `REVIEW_MAX_REVIEWERS` models (default 2) from the `MODELn_REVIEW=true` pool run the pi-runner inside Docker against the diff and return their own list of findings (`{filePath, line, severity, comment}`). If more review models are configured than the cap allows, the active subset is **picked randomly per PR** — so different PRs may use different models, giving cost-bounded diversity. Each model runs **once per assigned role** (its review personas — e.g. `correctness`, `security`, `readability`, or the catch-all `generic`), each run carrying a role-focused prompt. So the number of review pi-runs per PR is the **sum of roles across the sampled models**, not just the model count — e.g. two sampled models with two roles each is four runs. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. Findings are tagged with the authoring model and the role that produced them. Findings on lockfiles are dropped automatically. If *all* active review models fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
 
 **Stage 3 — Fetch whole files.** For each distinct finding path (excluding lockfiles), the provider's `getFileContent` is called once at the source branch. This populates `fileContentByPath`, used both for the line-count check and as full-file context for validators.
 
@@ -577,7 +577,7 @@ Where the money goes, and what bounds it:
 
 | Cost driver | Bound |
 |-------------|-------|
-| Review pass | ≤ `REVIEW_MAX_REVIEWERS` pi-runs per PR; diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. |
+| Review pass | ≤ `REVIEW_MAX_REVIEWERS` models × each model's role count pi-runs per PR (one run per model per assigned role); diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. |
 | Same-run dedup | One LLM call per file with 2+ findings (files with one finding cost nothing). |
 | Info-gather (proactive) | One LLM call per finding-file; output ≤ `REVIEW_MAX_INFO_TOKENS` × 4 chars per call. |
 | Info-gather (follow-up) | At most one extra call per file *that filed a request*, same budget. Runs at most once per PR. |
@@ -589,6 +589,7 @@ Where the money goes, and what bounds it:
 Remaining caveats:
 
 - **Cost scales with file count.** With N finding-files in a PR, dedup + proactive gather + follow-up are each up to N calls. There is no single global per-PR token cap — the bounds above are per-call. To cap aggressively, lower `REVIEW_MAX_INFO_TOKENS` (or set `0`), and keep `REVIEW_MAX_REVIEWERS`/`REVIEW_MAX_VALIDATORS` at 2.
+- **Review runs scale with roles, not just models.** `REVIEW_MAX_REVIEWERS` bounds the model count, but each sampled model runs once per assigned role — so a model with three roles costs three pi-runs. Keep role counts modest, or lower `REVIEW_MAX_REVIEWERS`, to bound per-PR review cost.
 - **Parallel fan-out has no concurrency limit.** Per-file dedup and gather calls all fire at once; a 50-file PR makes 50 concurrent LLM requests. That's a rate-limit risk (429s degrade gracefully to "no result"), not a cost risk.
 - **Working-tree assumption.** `git grep` operates on the local clone's working tree, which is reset to the source branch before each review. The pipeline assumes review and fix flows for the same `(project, slug)` are **serialized** (the existing pollers enforce this). Concurrent flows on the same local repo would race on the working tree.
 - **`infoRequest` is free text.** Vague requests ("more context please") produce nothing useful. The round-1 prompt nudges validators toward specific paths or symbols, but model behavior here is best-effort, not enforced.
@@ -597,7 +598,21 @@ Remaining caveats:
 
 ### Endpoint compatibility
 
-Any OpenAI-compatible `chat/completions` endpoint works. Azure OpenAI is supported via `MODELn_AUTH_HEADER=api-key` + `MODELn_MAX_TOKEN_PARAM=max_tokens`. Models that do not support `json_schema` response format can use `MODELn_SUPPORTS_STRUCTURED_OUTPUT=false` (falls back to prompt-only JSON; the validator's lenient parse handles the missing `infoRequest` field automatically).
+`MODELn_API_BASE` is consumed by **two** clients with different needs, so it must point at an **OpenAI-compatible `chat/completions`** endpoint:
+
+- **Validator** (always active): calls `${MODELn_API_BASE}/chat/completions` directly.
+- **Review pass** (`MODELn_REVIEW=true`): runs pi in Docker with `--provider MODELn_PROVIDER`. For `anthropic`/`google`/most providers pi uses its **built-in** base URL and **ignores** `MODELn_API_BASE`; only `azure-openai-responses` reads it (as `AZURE_OPENAI_BASE_URL`).
+
+OpenAI-compatible base URLs for common providers (these satisfy the validator, while the review pass routes by `MODELn_PROVIDER`):
+
+| Provider (`MODELn_PROVIDER`) | `MODELn_API_BASE` (validator) | Key env var (review pass) |
+|------|------|------|
+| `anthropic` | `https://api.anthropic.com/v1/` | `ANTHROPIC_API_KEY` |
+| `google` (Gemini) | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `azure-openai-responses` | `https://<resource>.openai.azure.com/openai/v1` | `AZURE_OPENAI_API_KEY` |
+
+The single `MODELn_API_KEY` you set serves both paths (forwarded to pi under the provider's key env var automatically). Azure OpenAI also needs `MODELn_AUTH_HEADER=api-key` + `MODELn_MAX_TOKEN_PARAM=max_tokens`. Models that do not support `json_schema` response format can use `MODELn_SUPPORTS_STRUCTURED_OUTPUT=false` (falls back to prompt-only JSON; the validator's lenient parse handles the missing `infoRequest` field automatically).
 
 ### Fix PRs (3-round improvement loop)
 
