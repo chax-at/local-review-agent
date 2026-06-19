@@ -21,6 +21,7 @@ import { ChangelogService } from './audit/changelog.service';
 import { BambooStateService } from './bamboo/bamboo.state.service';
 import { BambooPollerService } from './bamboo/bamboo.poller.service';
 import { MentionRouter } from './poller/mention-router';
+import { parseRoles, assertCorrectnessCovered } from './reviewer/personas';
 
 export interface IBootstrapInput {
   provider: IGitProvider;
@@ -101,9 +102,11 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
       apiKey,
       apiBase,
     );
+    const name = config.get(`${key}.Name`) || key;
     return {
-      name: config.get(`${key}.Name`) || key,
+      name,
       pi,
+      roles: parseRoles(config.get(`${key}.Roles`), name),
       inputCostPer1M: config.get(`${key}.InputTokenCostPer1M`),
       outputCostPer1M: config.get(`${key}.OutputTokenCostPer1M`),
     };
@@ -111,6 +114,10 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
 
   const validators = modelKeys.map(buildLlmClient).filter(Boolean) as LlmClient[];
   const reviewModels = modelKeys.map(buildReviewModel).filter(Boolean) as IReviewModel[];
+
+  if (reviewModels.length > 0) {
+    assertCorrectnessCovered(reviewModels.map((m) => m.roles));
+  }
 
   LogSink.debug(`Validation models: ${validators.map((v) => v.name).join(', ') || 'none'}`, TraceTags.DEBUG);
   LogSink.debug(`Review models: ${reviewModels.map((m) => m.name).join(', ') || 'none'}`, TraceTags.DEBUG);
