@@ -8,6 +8,8 @@ export interface IReviewFinding {
 /** A review finding tagged with the model (Name) that produced it. */
 export interface IAuthoredFinding extends IReviewFinding {
   author: string;
+  /** The review role (persona) that produced this finding, e.g. "security". */
+  persona?: string;
   /**
    * Set only when this finding is the product of merging duplicate findings
    * (see FindingDeduplicator): every model whose finding contributed. The

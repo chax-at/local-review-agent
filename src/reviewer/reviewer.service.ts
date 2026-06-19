@@ -29,11 +29,14 @@ import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
 import { FindingDeduplicator } from './finding-deduplicator';
 import { branchTimestamp, isBotComment } from '../constants';
 import type { IMentionToolResult } from '../poller/mention-executor';
+import type { ReviewPersona } from './personas';
+import { PERSONA_DIRECTIVES } from './personas';
 
 /** A model that performs the review pass via its pi-runner, with cost metadata for usage attribution. */
 export interface IReviewModel {
   name: string;
   pi: PiService;
+  roles: ReviewPersona[];
   inputCostPer1M: number;
   outputCostPer1M: number;
 }
@@ -47,6 +50,23 @@ export function groupFindingsByFile(findings: IAuthoredFinding[]): Map<string, I
     else out.set(f.filePath, [f]);
   }
   return out;
+}
+
+/** A single review pass: one model running one of its roles. */
+export interface IReviewerRun {
+  model: IReviewModel;
+  role: ReviewPersona;
+}
+
+/** Flatten active reviewers into one run per (model, role) pair, in order. */
+export function expandReviewerRuns(reviewers: IReviewModel[]): IReviewerRun[] {
+  const runs: IReviewerRun[] = [];
+  for (const model of reviewers) {
+    for (const role of model.roles) {
+      runs.push({ model, role });
+    }
+  }
+  return runs;
 }
 
 /**
@@ -436,22 +456,24 @@ export class ReviewerService {
     // Cap the active review pool to maxReviewers (random pick per PR).
     // Different PRs may use different subsets — bounded cost with diversity.
     const activeReviewers = this.pickActiveReviewers();
+    const runs = expandReviewerRuns(activeReviewers);
     LogSink.info(
-      `PR #${prId}: active reviewers (${activeReviewers.length}/${this.reviewModels.length}): ${activeReviewers.map((r) => r.name).join(', ')}`,
+      `PR #${prId}: ${runs.length} review run(s) across ${activeReviewers.length}/${this.reviewModels.length} ` +
+        `model(s): ${runs.map((r) => `${r.model.name}/${r.role}`).join(', ')}`,
       TraceTags.REVIEWER,
     );
 
     const allFindings: IAuthoredFinding[] = [];
     const reviewUsage: IModelUsage[] = [];
-    for (const rm of activeReviewers) {
+    for (const { model: rm, role } of runs) {
       try {
-        const batch = rm.pi.reviewBatch(reviewable, standards, reviewCommentContext, dockerImage);
+        const batch = rm.pi.reviewBatch(reviewable, standards, reviewCommentContext, dockerImage, PERSONA_DIRECTIVES[role]);
         for (const f of batch.findings) {
-          allFindings.push({ ...f, author: rm.name });
+          allFindings.push({ ...f, author: rm.name, persona: role });
         }
         reviewUsage.push(this.toModelUsage(rm, batch.usage));
       } catch (err) {
-        LogSink.warn(`PR #${prId}: review model ${rm.name} failed: ${err}`, TraceTags.REVIEWER);
+        LogSink.warn(`PR #${prId}: review model ${rm.name} (role ${role}) failed: ${err}`, TraceTags.REVIEWER);
       }
     }
 
