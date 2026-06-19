@@ -8,4 +8,11 @@ describe('model config', () => {
     expect(config.get('Model1.Review')).toBe(false);
     expect(config.get('Model4.MaxTokenParam')).toBe('max_completion_tokens');
   });
+
+  it('defaults every model Roles to "generic"', () => {
+    expect(config.get('Model1.Roles')).toBe('generic');
+    expect(config.get('Model2.Roles')).toBe('generic');
+    expect(config.get('Model3.Roles')).toBe('generic');
+    expect(config.get('Model4.Roles')).toBe('generic');
+  });
 });
