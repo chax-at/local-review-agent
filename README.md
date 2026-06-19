@@ -39,8 +39,8 @@ cp .env.sample .env
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `BITBUCKET_PAT` | For Server | Bitbucket personal access token (repo read+write) |
-| `MODEL1_API_KEY` | For PR review & fixes | API key for Model 1 (any OpenAI-compatible provider) |
-| `MODEL1_API_BASE` | For PR review & fixes | API base URL (e.g. `https://api.openai.com/v1`) |
+| `MODEL1_API_KEY` | For PR review & fixes | API key for Model 1. Serves both the validator and (when `MODEL1_REVIEW=true`) the pi review pass — forwarded to pi under the provider's key env var automatically. |
+| `MODEL1_API_BASE` | For PR review & fixes | OpenAI-compatible `chat/completions` base URL used by the validator (e.g. `https://api.openai.com/v1`). The review pass routes by `MODEL1_PROVIDER` and uses pi's built-in base for non-Azure providers — see [Endpoint compatibility](#endpoint-compatibility). |
 | `MODEL1_MODEL` | For PR review & fixes | Model name |
 | `MODEL1_NAME` | Optional | Display name in review comments |
 | `MODEL1_AUTH_HEADER` | Optional | Custom auth header name (e.g. `api-key` for Azure) |

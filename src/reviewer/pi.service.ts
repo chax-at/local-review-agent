@@ -120,21 +120,36 @@ function normalizeUsageObject(u: Record<string, unknown>): { input: number; outp
 }
 
 /**
- * Throws if pi output contains zero `message_end` events. This catches
- * container-level failures (e.g. `pi: not found`, missing API key) that
- * produce no structured output and would otherwise be silently treated as
- * "no findings" by the chunk-tolerant batch script.
+ * Throws if pi produced no usable model response. Catches two failure modes
+ * the chunk-tolerant batch script would otherwise treat as "no findings":
+ *  - container-level failures (e.g. `pi: not found`, missing API key) that
+ *    emit zero `message_end` events;
+ *  - provider-level failures (e.g. a 404 from a base-URL/provider mismatch)
+ *    where every `message_end` carries `stopReason: 'error'` and empty
+ *    content. A successful response on any call is enough to pass.
  */
 export function assertPiProducedResponse(output: string): void {
+  let lastError: string | null = null;
   for (const line of output.split('\n')) {
     const t = line.trim();
     if (!t.startsWith('{')) continue;
     try {
-      const e = JSON.parse(t) as { type?: string } | null;
-      if (e && e.type === 'message_end') return;
+      const e = JSON.parse(t) as {
+        type?: string;
+        message?: { stopReason?: string; errorMessage?: string };
+      } | null;
+      if (!e || e.type !== 'message_end') continue;
+      if (e.message?.stopReason === 'error') {
+        lastError = e.message.errorMessage ?? 'unknown error';
+        continue;
+      }
+      return;
     } catch {
       continue;
     }
+  }
+  if (lastError !== null) {
+    throw new Error(`pi failed on every model call. Last error: ${lastError}`);
   }
   const head = output.trim().slice(0, 500);
   throw new Error(`pi did not produce a model response. Output: ${head || '(empty)'}`);
@@ -274,6 +289,49 @@ export function parseFixProposalsBatch(output: string, expectedCount: number): I
   }
 
   return proposals;
+}
+
+/**
+ * Map a pi provider to its API-key env var name, mirroring pi's own
+ * `getApiKeyEnvVars`. Providers omitted here are not configured in this repo.
+ */
+const PROVIDER_API_KEY_ENV: Record<string, string> = {
+  anthropic: 'ANTHROPIC_API_KEY',
+  google: 'GEMINI_API_KEY',
+  'google-vertex': 'GOOGLE_CLOUD_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  'azure-openai-responses': 'AZURE_OPENAI_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  xai: 'XAI_API_KEY',
+  deepseek: 'DEEPSEEK_API_KEY',
+  mistral: 'MISTRAL_API_KEY',
+  groq: 'GROQ_API_KEY',
+};
+
+/**
+ * Build the `-e KEY=VAL` docker args that hand pi its credentials.
+ *
+ * Each provider reads its key from a different env var, so the key is passed
+ * under the name pi expects (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ...).
+ * Only `azure-openai-responses` consumes a configurable base URL
+ * (`AZURE_OPENAI_BASE_URL`) and deployment name (`AZURE_OPENAI_MODEL`); every
+ * other provider uses pi's built-in base, so `apiBase` is intentionally
+ * ignored for them (the `--model` CLI flag carries the model id).
+ */
+export function buildProviderEnvArgs(
+  provider: string,
+  apiKey: string,
+  apiBase: string,
+  model: string,
+): string[] {
+  if (!apiKey) return [];
+  const keyEnv = PROVIDER_API_KEY_ENV[provider] ?? 'AZURE_OPENAI_API_KEY';
+  const args = ['-e', `${keyEnv}=${apiKey}`];
+  if (provider === 'azure-openai-responses') {
+    if (apiBase) args.push('-e', `AZURE_OPENAI_BASE_URL=${apiBase}`);
+    args.push('-e', `AZURE_OPENAI_MODEL=${model}`);
+  }
+  return args;
 }
 
 export class PiService {
@@ -615,18 +673,15 @@ export class PiService {
       '-e',
       'HOME=/tmp',
       ...opts.mounts.flatMap((m) => ['-v', `${m.host}:${m.container}${m.readonly ? ':ro' : ''}`]),
-      ...(this.apiKey ? ['-e', `AZURE_OPENAI_API_KEY=${this.apiKey}`] : []),
-      ...(this.apiBase ? ['-e', `AZURE_OPENAI_BASE_URL=${this.apiBase}`] : []),
-      '-e',
-      `AZURE_OPENAI_MODEL=${this.model}`,
+      ...buildProviderEnvArgs(this.provider, this.apiKey, this.apiBase, this.model),
       ...(opts.workdir ? ['-w', opts.workdir] : []),
       image,
       'sh',
       '/workspace/run-docker.sh',
     ];
 
-    // Log command (redact API key)
-    const logArgs = args.map((a) => (a.startsWith('AZURE_OPENAI_API_KEY=') ? 'AZURE_OPENAI_API_KEY=***' : a));
+    // Log command (redact any *_API_KEY value)
+    const logArgs = args.map((a) => a.replace(/(_API_KEY=).+/, '$1***'));
     LogSink.debug(`Docker: docker ${logArgs.join(' ')}`, TraceTags.PI);
 
     const timeout = opts.timeout ?? this.timeoutMs + DOCKER_INSTALL_BUFFER_MS;

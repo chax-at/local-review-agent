@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parsePiFindings, aggregateUsageFromPiOutput, buildLintScript, parseFixProposal, parseFixProposalsBatch, assertPiProducedResponse } from '../../src/reviewer/pi.service';
+import { parsePiFindings, aggregateUsageFromPiOutput, buildLintScript, parseFixProposal, parseFixProposalsBatch, assertPiProducedResponse, buildProviderEnvArgs } from '../../src/reviewer/pi.service';
 
 describe('parsePiFindings', () => {
   it('should extract findings from pi JSON output', () => {
@@ -171,6 +171,58 @@ describe('assertPiProducedResponse', () => {
       JSON.stringify({ type: 'message_end', usage: { input: 10, output: 5 } }),
     ].join('\n');
     expect(() => assertPiProducedResponse(output)).not.toThrow();
+  });
+
+  it('throws and surfaces the error when every message_end is a provider error', () => {
+    const errEvent = JSON.stringify({
+      type: 'message_end',
+      message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '404 Not found' },
+    });
+    const output = [errEvent, errEvent].join('\n');
+    expect(() => assertPiProducedResponse(output)).toThrowError(/404 Not found/);
+  });
+
+  it('does not throw when at least one message_end succeeds despite another erroring', () => {
+    const errEvent = JSON.stringify({
+      type: 'message_end',
+      message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '429 rate limited' },
+    });
+    const okEvent = JSON.stringify({
+      type: 'message_end',
+      message: { role: 'assistant', content: [{ type: 'text', text: '{"findings":[]}' }] },
+    });
+    expect(() => assertPiProducedResponse([errEvent, okEvent].join('\n'))).not.toThrow();
+  });
+});
+
+describe('buildProviderEnvArgs', () => {
+  it('passes the Anthropic key under ANTHROPIC_API_KEY and no base (built-in)', () => {
+    expect(buildProviderEnvArgs('anthropic', 'sk-ant-x', 'https://api.anthropic.com/v1/', 'claude-opus-4-8')).toEqual([
+      '-e',
+      'ANTHROPIC_API_KEY=sk-ant-x',
+    ]);
+  });
+
+  it('passes the Gemini key under GEMINI_API_KEY and no base (built-in)', () => {
+    expect(buildProviderEnvArgs('google', 'g-key', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-3.1-pro')).toEqual([
+      '-e',
+      'GEMINI_API_KEY=g-key',
+    ]);
+  });
+
+  it('keeps Azure key, base URL, and model env vars for azure-openai-responses', () => {
+    expect(buildProviderEnvArgs('azure-openai-responses', 'az-key', 'https://x.openai.azure.com/openai/v1', 'gpt-5.5-1')).toEqual([
+      '-e',
+      'AZURE_OPENAI_API_KEY=az-key',
+      '-e',
+      'AZURE_OPENAI_BASE_URL=https://x.openai.azure.com/openai/v1',
+      '-e',
+      'AZURE_OPENAI_MODEL=gpt-5.5-1',
+    ]);
+  });
+
+  it('omits the key env var when no API key is configured', () => {
+    expect(buildProviderEnvArgs('anthropic', '', '', 'claude-opus-4-8')).toEqual([]);
   });
 });
 
