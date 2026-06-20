@@ -20,7 +20,6 @@
     "MaxDiffLines": 5000,
     "MaxFileLines": 1000,
     "MaxInfoTokens": 8000,
-    "MaxReviewers": 2,
     "MaxValidators": 2
   },
   "Model1": {

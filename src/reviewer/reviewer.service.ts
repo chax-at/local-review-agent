@@ -21,7 +21,6 @@ import type { IModelUsage, IAuthoredFinding } from '../types';
 import { filterExcludedFindings } from './finding-filter';
 import {
   MultiModelValidator,
-  pickRandom,
   type IValidatedFinding,
   type IFollowUpInfoGatherer,
 } from './multi-model-validator';
@@ -199,7 +198,6 @@ export class ReviewerService {
   private readonly carrotConfigService: CarrotConfigService;
   private readonly infoGatherer: InfoGatherer;
   private readonly deduplicator: FindingDeduplicator;
-  private readonly maxReviewers: number;
   private readonly maxValidators: number;
 
   constructor(
@@ -213,7 +211,6 @@ export class ReviewerService {
     carrotConfigService: CarrotConfigService,
     infoGatherer: InfoGatherer,
     deduplicator: FindingDeduplicator,
-    maxReviewers: number,
     maxValidators: number,
   ) {
     this.provider = provider;
@@ -226,18 +223,7 @@ export class ReviewerService {
     this.carrotConfigService = carrotConfigService;
     this.infoGatherer = infoGatherer;
     this.deduplicator = deduplicator;
-    this.maxReviewers = maxReviewers;
     this.maxValidators = maxValidators;
-  }
-
-  /**
-   * Pick a random subset of the configured review models, capped at
-   * `maxReviewers` (0 = no cap). Called once per PR review so different PRs
-   * may use different models, but the same PR's review pass is internally
-   * consistent.
-   */
-  private pickActiveReviewers(): IReviewModel[] {
-    return pickRandom(this.reviewModels, this.maxReviewers);
   }
 
   /**
@@ -288,10 +274,15 @@ export class ReviewerService {
     };
   }
 
-  /** Attribute a pi-runner token usage to a review model, costed with that model's rates. */
-  private toModelUsage(rm: IReviewModel, usage: IPiTokenUsage): IModelUsage {
+  /**
+   * Attribute a pi-runner token usage to a review model, costed with that
+   * model's rates. When `role` is given (the review pass), it's appended to the
+   * displayed name (e.g. `Opus 4.8 (readability)`) so the footer breaks usage
+   * down per role; fix/propose/lint runs omit it and show the plain name.
+   */
+  private toModelUsage(rm: IReviewModel, usage: IPiTokenUsage, role?: ReviewPersona): IModelUsage {
     return {
-      modelName: rm.name,
+      modelName: role ? `${rm.name} (${role})` : rm.name,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       costEur:
@@ -453,13 +444,11 @@ export class ReviewerService {
       return null;
     }
 
-    // Cap the active review pool to maxReviewers (random pick per PR).
-    // Different PRs may use different subsets — bounded cost with diversity.
-    const activeReviewers = this.pickActiveReviewers();
-    const runs = expandReviewerRuns(activeReviewers);
+    // Every review-enabled model runs, each once per assigned role.
+    const runs = expandReviewerRuns(this.reviewModels);
     LogSink.info(
-      `PR #${prId}: ${runs.length} review run(s) across ${activeReviewers.length}/${this.reviewModels.length} ` +
-        `model(s): ${runs.map((r) => `${r.model.name}/${r.role}`).join(', ')}`,
+      `PR #${prId}: ${runs.length} review run(s) across ${this.reviewModels.length} model(s): ` +
+        `${runs.map((r) => `${r.model.name}/${r.role}`).join(', ')}`,
       TraceTags.REVIEWER,
     );
 
@@ -471,23 +460,22 @@ export class ReviewerService {
         for (const f of batch.findings) {
           allFindings.push({ ...f, author: rm.name, persona: role });
         }
-        reviewUsage.push(this.toModelUsage(rm, batch.usage));
+        reviewUsage.push(this.toModelUsage(rm, batch.usage, role));
       } catch (err) {
         LogSink.warn(`PR #${prId}: review model ${rm.name} (role ${role}) failed: ${err}`, TraceTags.REVIEWER);
       }
     }
 
-    // Every active review model errored — surface it as a failure rather than
-    // posting a misleading "no issues found" summary. (A model that returns
-    // zero findings still records usage, so an empty reviewUsage means no
-    // model produced output.)
+    // Every review run errored — surface it as a failure rather than posting a
+    // misleading "no issues found" summary. (A run that returns zero findings
+    // still records usage, so an empty reviewUsage means nothing produced output.)
     if (reviewUsage.length === 0) {
-      throw new Error(`all ${activeReviewers.length} active review model(s) failed`);
+      throw new Error(`all ${runs.length} review run(s) failed`);
     }
 
     if (allFindings.length === 0) {
       LogSink.info(
-        `PR #${prId}: no issues found across ${activeReviewers.length} active review model(s)`,
+        `PR #${prId}: no issues found across ${runs.length} review run(s)`,
         TraceTags.REVIEWER,
       );
     }
@@ -705,7 +693,10 @@ export class ReviewerService {
           // validateSuggestions internally filters replaceProposals to those with
           // entries in fileContextMap (i.e., proposals that survived isAddedRange).
           if (fileContextMap.size > 0) {
-            const result = await activeValidator.validateSuggestions(
+            // Proposals (code suggestions) get a single validator deciding whether
+            // they're worth posting — not the full council used for findings.
+            const suggestionValidator = activeValidator.withRandomSubset(1);
+            const result = await suggestionValidator.validateSuggestions(
               validatedFindings,
               replaceProposals,
               fileContextMap,
@@ -713,7 +704,7 @@ export class ReviewerService {
             approvedSuggestions = result.approvedSuggestions;
             validationUsage.push(...result.usage);
             LogSink.info(
-              `PR #${prId}: suggestion council approved ${result.approvedSuggestions.size}, discarded ${result.discardedRound1} round 1 + ${result.discardedRound2} round 2`,
+              `PR #${prId}: suggestion validator (${suggestionValidator.modelNames.join(', ')}) approved ${result.approvedSuggestions.size}, discarded ${result.discardedRound1} round 1 + ${result.discardedRound2} round 2`,
               TraceTags.REVIEWER,
             );
           }

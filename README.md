@@ -58,7 +58,6 @@ cp .env.sample .env
 | `REVIEW_MAX_DIFF_LINES` | Optional | Diffs larger than this line count are skipped (default: 5000) |
 | `REVIEW_MAX_FILE_LINES` | Optional | Files larger than this line count are skipped in review (default: 1000) |
 | `REVIEW_MAX_INFO_TOKENS` | Optional | Token budget for the info-gatherer's added context (DTOs / symbol matches). Roughly 4 chars per token. Set `0` to disable info-gathering. Default: 8000. |
-| `REVIEW_MAX_REVIEWERS` | Optional | Cap on the number of review models that run per PR. If more `MODELn_REVIEW=true` models are configured, a random subset of this size is picked per PR. Set `0` for no cap. Default: 2. |
 | `REVIEW_MAX_VALIDATORS` | Optional | Cap on the number of validators that vote per PR. If more validator-enabled models are configured, a random subset of this size is picked per PR and reused across round 1, round 2, suggestion votes, and fix-prompt drafting. Set `0` for no cap. Default: 2. |
 | `SUMMARIZER_API_KEY` | Optional | API key for the Bamboo changelog summarizer (separate from PR review — see below) |
 | `SUMMARIZER_API_BASE` | Optional | Endpoint URL |
@@ -479,7 +478,7 @@ One audit PR per (repo, target branch) at a time. New vulnerabilities update the
 
 The bot supports four general-purpose models (`Model1`–`Model4`). Each model is by default a **validator**; setting `MODELn_REVIEW=true` additionally enrolls it in the **review** pool (which runs the Docker pi-runner). The first validator-enabled model also doubles as the **info-gatherer**.
 
-By default the bot uses **at most 2 reviewers and 2 validators per PR** (configurable via `REVIEW_MAX_REVIEWERS` / `REVIEW_MAX_VALIDATORS`; set `0` for no cap). When more models are configured than the cap allows, the active subset is picked **randomly per PR** — different PRs may see different models, giving you cost-bounded diversity over time. Within a single PR the picked subset is stable: round 1, round 2, suggestion votes, and fix-prompt drafting all see the same validators.
+**Every `MODELn_REVIEW=true` model runs on each PR** (see [Review personas](#review-personas-roles) for how each model's roles expand into runs). **Validators** are capped at `REVIEW_MAX_VALIDATORS` (default 2; set `0` for no cap): if more validator-enabled models are configured, a random subset of that size votes per PR — different PRs may see different validators, giving cost-bounded diversity. Within a single PR the picked validator subset is stable: round 1, round 2, suggestion votes, and fix-prompt drafting all see the same validators.
 
 ### Review personas (roles)
 
@@ -492,7 +491,7 @@ Each review model is assigned one or more **roles** via `MODELn_ROLES` (comma-se
 | `readability` | Naming, dead code, duplication, unclear intent, code-standard violations |
 | `generic` | All-round review (the original single-prompt behavior) |
 
-So the number of review pi-runs per PR is the **sum of roles across the sampled models** — two sampled models with two roles each is four runs. `REVIEW_MAX_REVIEWERS` bounds the *model* count, not the run count, so keep role lists modest to bound cost. Findings are tagged with both the authoring model and the role that produced them, and flow into the same dedup + validation pipeline. At startup the bot validates every role string and **refuses to run** unless some review model covers `correctness` (an explicit `correctness` role, or any `generic` model); unknown or duplicate roles also fail fast.
+So the number of review pi-runs per PR is the **sum of roles across all review models** — two models with two roles each is four runs. Every review-enabled model runs every PR (there is no reviewer cap), so keep role lists modest to bound cost. Findings are tagged with both the authoring model and the role that produced them, and flow into the same dedup + validation pipeline. At startup the bot validates every role string and **refuses to run** unless some review model covers `correctness` (an explicit `correctness` role, or any `generic` model); unknown or duplicate roles also fail fast.
 
 ### End-to-end review workflow
 
@@ -501,7 +500,7 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  1. clone/fetch + compute diff (origin/target...origin/source)       │
-│  2. review pass (≤MaxReviewers×roles runs), each shown the existing  │
+│  2. review pass (one run per model × role), each shown the existing  │
 │     PR comments so it won't re-raise addressed issues  → findings[]  │
 │  3. fetch whole files (provider API)                → contentByPath  │
 │  4. filter findings on files > MaxFileLines         → keptFindings[] │
@@ -522,7 +521,7 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 
 **Stage 1 — Clone/fetch + diff.** `GitService.cloneOrFetch` ensures the local repo is up to date; `GitService.getDiff` produces a three-dot diff against the merge base. If the diff is empty, the review aborts cleanly with no comment.
 
-**Stage 2 — Review pass.** The sampled review models run the pi-runner inside Docker against the diff and return their own findings (`{filePath, line, severity, comment}`) — once per assigned [role](#review-personas-roles), so the run count is the sum of roles across the sampled models. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. Findings are tagged with the authoring model and role. Findings on lockfiles are dropped automatically. If *all* active review runs fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
+**Stage 2 — Review pass.** Every review-enabled model runs the pi-runner inside Docker against the diff and returns its own findings (`{filePath, line, severity, comment}`) — once per assigned [role](#review-personas-roles), so the run count is the sum of roles across all review models. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. Findings are tagged with the authoring model and role. Findings on lockfiles are dropped automatically. If *all* active review runs fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
 
 **Stage 3 — Fetch whole files.** For each distinct finding path (excluding lockfiles), the provider's `getFileContent` is called once at the source branch. This populates `fileContentByPath`, used both for the line-count check and as full-file context for validators.
 
@@ -591,7 +590,7 @@ Where the money goes, and what bounds it:
 
 | Cost driver | Bound |
 |-------------|-------|
-| Review pass | ≤ `REVIEW_MAX_REVIEWERS` models × each model's role count pi-runs per PR (one run per model per assigned role); diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. |
+| Review pass | every review model × its role count pi-runs per PR (one run per model per assigned role); diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. |
 | Same-run dedup | One LLM call per file with 2+ findings (files with one finding cost nothing). |
 | Info-gather (proactive) | One LLM call per finding-file; output ≤ `REVIEW_MAX_INFO_TOKENS` × 4 chars per call. |
 | Info-gather (follow-up) | At most one extra call per file *that filed a request*, same budget. Runs at most once per PR. |
@@ -602,7 +601,7 @@ Where the money goes, and what bounds it:
 
 Remaining caveats:
 
-- **Cost scales with file count.** With N finding-files in a PR, dedup + proactive gather + follow-up are each up to N calls. There is no single global per-PR token cap — the bounds above are per-call. To cap aggressively, lower `REVIEW_MAX_INFO_TOKENS` (or set `0`), and keep `REVIEW_MAX_REVIEWERS`/`REVIEW_MAX_VALIDATORS` at 2.
+- **Cost scales with file count.** With N finding-files in a PR, dedup + proactive gather + follow-up are each up to N calls. There is no single global per-PR token cap — the bounds above are per-call. To cap aggressively, lower `REVIEW_MAX_INFO_TOKENS` (or set `0`), keep role lists short (each role is a pi-run), and keep `REVIEW_MAX_VALIDATORS` at 2.
 - **Parallel fan-out has no concurrency limit.** Per-file dedup and gather calls all fire at once; a 50-file PR makes 50 concurrent LLM requests. That's a rate-limit risk (429s degrade gracefully to "no result"), not a cost risk.
 - **Working-tree assumption.** `git grep` operates on the local clone's working tree, which is reset to the source branch before each review. The pipeline assumes review and fix flows for the same `(project, slug)` are **serialized** (the existing pollers enforce this). Concurrent flows on the same local repo would race on the working tree.
 - **`infoRequest` is free text.** Vague requests ("more context please") produce nothing useful. The round-1 prompt nudges validators toward specific paths or symbols, but model behavior here is best-effort, not enforced.

@@ -47,7 +47,6 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const maxDiffLines = config.get('Review.MaxDiffLines');
   const maxFileLines = config.get('Review.MaxFileLines');
   const maxInfoTokens = config.get('Review.MaxInfoTokens');
-  const maxReviewers = config.get('Review.MaxReviewers');
   const maxValidators = config.get('Review.MaxValidators');
   const workDir = config.get('WorkDir');
   const dataDir = config.get('DataDir');
@@ -198,7 +197,6 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     carrotConfigService,
     infoGatherer,
     deduplicator,
-    maxReviewers,
     maxValidators,
   );
   const npmRegistry = new NpmRegistryClient();

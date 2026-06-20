@@ -14,7 +14,6 @@
     "MaxDiffLines": { "__name": "REVIEW_MAX_DIFF_LINES", "__format": "number" },
     "MaxFileLines": { "__name": "REVIEW_MAX_FILE_LINES", "__format": "number" },
     "MaxInfoTokens": { "__name": "REVIEW_MAX_INFO_TOKENS", "__format": "number" },
-    "MaxReviewers": { "__name": "REVIEW_MAX_REVIEWERS", "__format": "number" },
     "MaxValidators": { "__name": "REVIEW_MAX_VALIDATORS", "__format": "number" }
   },
   "Model1": {
