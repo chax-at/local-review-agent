@@ -250,6 +250,8 @@ export class PollerService {
               carrotConf.dockerImage,
               carrotConf.rulesFiles,
               carrotConf.generateFixPrompts,
+              latestCommit,
+              true, // auto-review: skip if a bot review for this commit is already on the PR
             );
           } catch (err) {
             // Record the failed attempt so the retry loop is bounded. Keep the
@@ -262,6 +264,10 @@ export class PollerService {
               processedMentionIds: prState?.processedMentionIds,
               reviewFailures: reviewFailures + 1,
             });
+            // Flush immediately: the failure count must survive a restart, or a
+            // killed-and-restarted daemon would reset the retry budget and
+            // re-review (re-comment) the PR from scratch every launch.
+            this.state.save();
             if (reviewFailures + 1 >= MAX_AUTO_REVIEW_ATTEMPTS) {
               LogSink.warn(
                 `PR #${pr.id}: auto-review failed ${reviewFailures + 1} time(s), giving up (mention @${this.botUsername} to retry)`,
@@ -281,6 +287,13 @@ export class PollerService {
           prState?.processedMentionIds ?? [],
           newProcessedIds,
         );
+
+        // Persist after every PR rather than once at cycle end. Review comments
+        // are posted to the remote as we go, so the `lastReviewedCommit` marker
+        // that suppresses a re-review must reach disk immediately — otherwise a
+        // mid-cycle kill loses every reviewed PR's marker and the restarted
+        // daemon re-reviews (re-comments on) PRs that already have comments.
+        this.state.save();
       } catch (err) {
         LogSink.error(`Failed to process PR #${pr.id} in ${repoKey}: ${err}`, TraceTags.POLLER);
       }
@@ -332,6 +345,7 @@ export class PollerService {
           slug,
           prId: pr.id,
           sourceBranch: pr.sourceBranch,
+          sourceCommit: pr.sourceCommit,
           targetBranch: pr.targetBranch,
           dockerImage: carrotConf.dockerImage,
           rulesFiles: carrotConf.rulesFiles,

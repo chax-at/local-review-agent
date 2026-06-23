@@ -21,6 +21,7 @@ interface IExecutorDeps {
     slug: string;
     prId: number;
     sourceBranch: string;
+    sourceCommit: string;
     targetBranch: string;
     dockerImage?: string;
     rulesFiles?: string[];
@@ -60,6 +61,8 @@ export async function executeMentionTool(
     case 'revert':
       return { success: true, message: await deps.handleRevert(route.message) };
     case 'review':
+      // Explicit re-review: pass the commit so the summary still carries the
+      // marker, but leave skipIfReviewed false — the user asked for it.
       await deps.reviewer.reviewPr(
         pr.project,
         pr.slug,
@@ -69,6 +72,7 @@ export async function executeMentionTool(
         pr.dockerImage,
         pr.rulesFiles,
         pr.generateFixPrompts,
+        pr.sourceCommit,
       );
       return { success: true, message: 'Review posted.' };
     case 'audit_fix':

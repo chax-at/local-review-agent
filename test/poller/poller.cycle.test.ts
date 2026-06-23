@@ -75,3 +75,68 @@ describe('poll cycle fetch-memo wiring', () => {
     );
   });
 });
+
+describe('poll cycle persists review state per PR (survives mid-cycle kill)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('saves state after each reviewed PR, not only once at cycle end', async () => {
+    const now = Date.now();
+    const mkPr = (id: number) => ({
+      id,
+      draft: false,
+      authorUsername: 'human',
+      sourceBranch: `feature-${id}`,
+      sourceCommit: `commit-${id}`,
+      targetBranch: 'main',
+    });
+
+    const git = { resetFetchMemo: vi.fn() };
+    const reviewer = { reviewPr: vi.fn().mockResolvedValue(undefined) };
+    const provider = {
+      listProjects: vi.fn().mockResolvedValue([{ key: 'P' }]),
+      listRepos: vi.fn().mockResolvedValue([{ slug: 'r' }]),
+      getOpenPullRequests: vi.fn().mockResolvedValue([mkPr(1), mkPr(2), mkPr(3)]),
+      getLatestCommitTimestampMs: vi.fn().mockResolvedValue(now),
+      getActivities: vi.fn().mockResolvedValue([]),
+    };
+    const carrotConfig = {
+      clearCache: vi.fn(),
+      resetCycleCarrotGaps: vi.fn(),
+      getCycleCarrotGaps: vi.fn().mockReturnValue({ missingFile: [], invalidFile: [] }),
+      getConfig: vi.fn().mockResolvedValue({
+        prReview: true,
+        rulesFiles: [],
+        generateFixPrompts: false,
+      }),
+    };
+    const state = {
+      pruneStale: vi.fn(),
+      load: vi.fn(),
+      save: vi.fn(),
+      getPrState: vi.fn().mockReturnValue(undefined),
+      setPrState: vi.fn(),
+    };
+
+    const poller = new PollerService(
+      provider as never,
+      state as never,
+      reviewer as never,
+      carrotConfig as never,
+      {} as never, // audit
+      git as never,
+      {} as never, // router
+      'bot',
+      1000,
+      '/tmp/heartbeat',
+    );
+
+    await (poller as unknown as { pollCycle(): Promise<void> }).pollCycle();
+
+    // 3 PRs reviewed → state must be flushed to disk at least once per PR, so a
+    // kill after PR #1 still durably records that PR #1 was reviewed.
+    expect(reviewer.reviewPr).toHaveBeenCalledTimes(3);
+    expect(state.save.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+});

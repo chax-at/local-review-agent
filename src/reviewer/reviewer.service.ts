@@ -27,6 +27,7 @@ import {
 import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
 import { FindingDeduplicator } from './finding-deduplicator';
 import { branchTimestamp, isBotComment } from '../constants';
+import { hasBotReviewForCommit, reviewCommitMarker } from './review-marker';
 import type { IMentionToolResult } from '../poller/mention-executor';
 import type { ReviewPersona } from './personas';
 import { PERSONA_DIRECTIVES } from './personas';
@@ -299,6 +300,8 @@ export class ReviewerService {
     dockerImage?: string,
     rulesFiles?: string[],
     generateFixPrompts?: boolean,
+    sourceCommit?: string,
+    skipIfReviewed = false,
   ): Promise<void> {
     LogSink.info(`Reviewing PR #${prId} in ${project}/${slug}`, TraceTags.REVIEWER);
 
@@ -306,6 +309,20 @@ export class ReviewerService {
     // what's already been said instead of re-raising fixed issues), and
     // postFindings reuses them for validator context and fix prompts.
     const existingComments = await this.provider.getComments(project, slug, prId);
+
+    // Remote-side backstop for the local `lastReviewedCommit` gate: if a prior
+    // run already posted a review for this exact commit, a missing/stale local
+    // state file (e.g. daemon killed mid-cycle before `state.json` flushed)
+    // must not cause a duplicate review. Only auto-review passes
+    // skipIfReviewed; an explicit @mention re-review is always honored.
+    if (skipIfReviewed && sourceCommit && hasBotReviewForCommit(existingComments, this.botUsername, sourceCommit)) {
+      LogSink.info(
+        `PR #${prId}: bot review for commit ${sourceCommit.slice(0, 7)} already present, skipping (local state was missing/stale)`,
+        TraceTags.REVIEWER,
+      );
+      return;
+    }
+
     const reviewCommentContext = formatExistingCommentsForReview(existingComments);
 
     let result: ReturnType<typeof this.runReview>;
@@ -381,6 +398,7 @@ export class ReviewerService {
         skippedLargeFiles,
         activeValidator,
         generateFixPrompts,
+        sourceCommit,
       );
     } catch (err) {
       LogSink.warn(`PR #${prId}: failed to post review summary, continuing: ${err}`, TraceTags.REVIEWER);
@@ -816,6 +834,7 @@ export class ReviewerService {
     skippedLargeFiles: string[],
     activeValidator: MultiModelValidator,
     generateFixPrompts?: boolean,
+    sourceCommit?: string,
   ): Promise<void> {
     const n = validatedFindings.length;
     const concerns = validatedFindings.filter((f) => f.severity === 'concern').length;
@@ -856,7 +875,10 @@ export class ReviewerService {
         : '';
 
     const footer = formatTokenFooter([...reviewUsage, ...validatorUsage]);
-    const commentBody = `${header}\n\n${breakdown}${skippedLine}${fixPromptsSection}${discardLine}\n\n${footer}`;
+    // Hidden marker so a restarted daemon can detect this commit was already
+    // reviewed even if its local state was lost (see reviewPr's skip guard).
+    const marker = sourceCommit ? `\n\n${reviewCommitMarker(sourceCommit)}` : '';
+    const commentBody = `${header}\n\n${breakdown}${skippedLine}${fixPromptsSection}${discardLine}\n\n${footer}${marker}`;
     await this.provider.postGeneralComment(project, slug, prId, commentBody);
   }
 
