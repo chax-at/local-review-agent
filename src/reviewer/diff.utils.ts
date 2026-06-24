@@ -224,3 +224,50 @@ export function isAddedRange(diffLines: string[], filePath: string, startLine: n
   }
   return true;
 }
+
+/**
+ * Return every ADDED (right-side) line for `filePath`, in diff order, as its
+ * new-file line number and content (the leading `+` stripped). Context and
+ * removed lines are skipped. Spans all hunks for the file. Returns an empty
+ * array if the file isn't present in the diff.
+ *
+ * Used to give the suggestion proposer the exact editable surface — Bitbucket
+ * applicable suggestions only anchor on ADDED lines — with the new-file numbers
+ * it must report back as a suggestion range.
+ */
+export function extractAddedLines(diffLines: string[], filePath: string): Array<{ line: number; content: string }> {
+  const added: Array<{ line: number; content: string }> = [];
+  let inFile = false;
+  let newLine = 0;
+
+  for (const line of diffLines) {
+    if (line.startsWith('+++ b/')) {
+      inFile = line === `+++ b/${filePath}`;
+      continue;
+    }
+    if (line.startsWith('--- ')) continue;
+    if (!inFile) continue;
+
+    const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+    if (hunkMatch) {
+      newLine = parseInt(hunkMatch[1], 10);
+      continue;
+    }
+
+    if (line.startsWith('-')) {
+      // Removed lines have no new-file line number.
+      continue;
+    }
+
+    if (line.startsWith('+')) {
+      added.push({ line: newLine, content: line.slice(1) });
+      newLine++;
+      continue;
+    }
+
+    // Context line — exists on both sides; new-file line counter advances.
+    newLine++;
+  }
+
+  return added;
+}

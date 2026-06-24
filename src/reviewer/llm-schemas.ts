@@ -51,6 +51,25 @@ export const FixValidationSchema = z.object({
   reason: z.string(),
 });
 
+/**
+ * Schema for proposeTextFixes: per finding, the model either proposes a `replace`
+ * on a contiguous range of added lines or `skip`s. Flat shape (vs discriminated
+ * union) so strict structured-output mode accepts it — unused fields are sent as
+ * 0 / "" and ignored by the caller.
+ */
+export const TextFixProposalsSchema = z.object({
+  proposals: z.array(
+    z.object({
+      index: z.number(),
+      action: z.enum(['replace', 'skip']),
+      startLine: z.number(),
+      endLine: z.number(),
+      replacement: z.string(),
+      reason: z.string(),
+    }),
+  ),
+});
+
 /** Convert a zod schema to a JSON Schema payload for structured output */
 function toJsonSchema(schema: z.ZodObject, name: string): IJsonSchema {
   const jsonSchema = schema.toJSONSchema({
@@ -71,6 +90,7 @@ export const findingsValidationWithInfoJsonSchema = toJsonSchema(
   'findings_validation_with_info',
 );
 export const fixValidationJsonSchema = toJsonSchema(FixValidationSchema, 'fix_validation');
+export const textFixProposalsJsonSchema = toJsonSchema(TextFixProposalsSchema, 'text_fix_proposals');
 export const dedupClustersJsonSchema = toJsonSchema(DedupClustersSchema, 'dedup_clusters');
 
 /**

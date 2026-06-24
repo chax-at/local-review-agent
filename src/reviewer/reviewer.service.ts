@@ -6,7 +6,7 @@ import { TraceTags } from '../log/tags';
 import type { IGitProvider } from '../provider/provider';
 import type { IComment, IInlineCommentInput } from '../provider/provider.types';
 import { GitService } from './git.service';
-import type { PiService, IFixProposal, IPiTokenUsage } from './pi.service';
+import type { PiService, IPiTokenUsage } from './pi.service';
 import {
   splitDiffByFile,
   isDiffTooLarge,
@@ -23,6 +23,7 @@ import {
   MultiModelValidator,
   type IValidatedFinding,
   type IFollowUpInfoGatherer,
+  type IFixProposal,
 } from './multi-model-validator';
 import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
 import { FindingDeduplicator } from './finding-deduplicator';
@@ -364,7 +365,6 @@ export class ReviewerService {
       );
     }
 
-    const repoDir = this.git.getRepoDir(project, slug);
     const { validationUsage, validatedFindings, allComments, discardedRound1, discardedRound2, skippedLargeFiles } =
       await this.postFindings(
         project,
@@ -374,10 +374,8 @@ export class ReviewerService {
         chunks,
         fullDiff,
         sourceBranch,
-        repoDir,
         activeValidator,
         existingComments,
-        dockerImage,
       );
 
     // Best-effort: inline comments are already posted and the PR's review state
@@ -509,10 +507,8 @@ export class ReviewerService {
     chunks: ReturnType<typeof splitDiffByFile>,
     fullDiff: string,
     sourceBranch: string,
-    repoDir: string,
     activeValidator: MultiModelValidator,
     existingComments: IComment[],
-    dockerImage?: string,
   ): Promise<{
     validationUsage: IModelUsage[];
     validatedFindings: IValidatedFinding[];
@@ -595,8 +591,7 @@ export class ReviewerService {
       let followUpGather: IFollowUpInfoGatherer | undefined;
       if (this.infoGatherer.isEnabled) {
         // git grep inside the gather tool reads the working tree, so we need
-        // the repo checked out at the source branch's tip. This also makes
-        // the subsequent proposeFixes reset idempotent.
+        // the repo checked out at the source branch's tip.
         try {
           this.git.resetToRemoteBranch(project, slug, sourceBranch);
         } catch (err) {
@@ -668,22 +663,25 @@ export class ReviewerService {
       }
     }
 
-    // 6b. Propose code suggestions for kept findings (validator-gated).
+    // 6b. Propose typo/description-only suggestions for kept findings, then
+    //     gate them with a validator. This runs on the chat-completions council
+    //     (no pi runner, no container): proposals are derived from the diff and
+    //     the file content already held in memory, so no repo checkout is needed.
     let approvedSuggestions = new Map<number, IFixProposal>();
-    if (validatedFindings.length > 0) {
+    if (validatedFindings.length > 0 && activeValidator.hasModels) {
       try {
         const carrotConfig = await this.carrotConfigService.getConfig(project, slug);
         const suggestEnabled = carrotConfig?.suggestCodeFixes !== false;
-        const primaryModel = this.reviewModels[0];
-        if (suggestEnabled && primaryModel) {
-          this.git.resetToRemoteBranch(project, slug, sourceBranch);
-          const { proposals, usage: proposeUsage } = primaryModel.pi.proposeFixes(
+        if (suggestEnabled) {
+          const { proposals, usage: proposeUsage } = await activeValidator.proposeTextFixes(
             validatedFindings,
-            repoDir,
-            dockerImage,
+            fullDiff,
           );
+          validationUsage.push(...proposeUsage);
 
-          // Build file-context map for replace-proposals only.
+          // Keep only replace-proposals whose range is entirely ADDED lines, and
+          // attach the surrounding file content (already fetched into
+          // fileContentByPath) as validation context.
           const replaceProposals = proposals.filter(
             (p): p is Extract<IFixProposal, { action: 'replace' }> => p.action === 'replace',
           );
@@ -697,11 +695,8 @@ export class ReviewerService {
             if (!isAddedRange(diffLinesForRange, finding.filePath, p.startLine, p.endLine)) {
               continue;
             }
-            const fileContent = await this.provider.getFileContent(project, slug, finding.filePath, {
-              at: sourceBranch,
-              quiet: true,
-            });
-            if (fileContent === null) continue;
+            const fileContent = fileContentByPath.get(finding.filePath);
+            if (!fileContent) continue;
             const fileLines = fileContent.split('\n');
             const sliceStart = Math.max(0, p.startLine - 1 - 300);
             const sliceEnd = Math.min(fileLines.length, p.endLine + 300);
@@ -711,9 +706,10 @@ export class ReviewerService {
           // validateSuggestions internally filters replaceProposals to those with
           // entries in fileContextMap (i.e., proposals that survived isAddedRange).
           if (fileContextMap.size > 0) {
-            // Proposals (code suggestions) get a single validator deciding whether
-            // they're worth posting — not the full council used for findings.
-            const suggestionValidator = activeValidator.withRandomSubset(1);
+            // Gate with a single validator, preferring one that did not author the
+            // proposal so the check is a genuinely independent second pass.
+            const proposerName = activeValidator.modelNames[0];
+            const suggestionValidator = activeValidator.withRandomSubset(1, proposerName ? [proposerName] : []);
             const result = await suggestionValidator.validateSuggestions(
               validatedFindings,
               replaceProposals,
@@ -727,11 +723,8 @@ export class ReviewerService {
             );
           }
 
-          // Attribute the proposeFixes pi-runner cost to the primary review model
-          // so it shows up in the summary footer (not just the debug log).
-          validationUsage.push(this.toModelUsage(primaryModel, proposeUsage));
           LogSink.debug(
-            `PR #${prId}: pi proposeFixes used ${proposeUsage.inputTokens}/${proposeUsage.outputTokens} tokens`,
+            `PR #${prId}: proposeTextFixes returned ${replaceProposals.length} replace proposal(s) for ${validatedFindings.length} finding(s)`,
             TraceTags.REVIEWER,
           );
         }

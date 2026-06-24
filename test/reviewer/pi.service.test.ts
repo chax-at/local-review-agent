@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parsePiFindings, aggregateUsageFromPiOutput, buildLintScript, parseFixProposal, parseFixProposalsBatch, assertPiProducedResponse, buildProviderEnvArgs } from '../../src/reviewer/pi.service';
+import { parsePiFindings, aggregateUsageFromPiOutput, buildLintScript, assertPiProducedResponse, buildProviderEnvArgs } from '../../src/reviewer/pi.service';
 
 describe('parsePiFindings', () => {
   it('should extract findings from pi JSON output', () => {
@@ -82,68 +82,6 @@ describe('buildLintScript', () => {
 
   it('produces the expected shell snippet for plain lint', () => {
     expect(buildLintScript('lint')).toBe('cd /repo && npm run lint');
-  });
-});
-
-describe('parseFixProposal', () => {
-  it('parses a "replace" action from raw JSON', () => {
-    const text = JSON.stringify({
-      action: 'replace',
-      replacement: 'const x = 1;\nconst y = 2;',
-      startLine: 10,
-      endLine: 11,
-    });
-    expect(parseFixProposal(text, 0)).toEqual({
-      action: 'replace',
-      findingIndex: 0,
-      replacement: 'const x = 1;\nconst y = 2;',
-      startLine: 10,
-      endLine: 11,
-    });
-  });
-
-  it('parses a "skip" action from raw JSON', () => {
-    const text = JSON.stringify({ action: 'skip', reason: 'architectural concern' });
-    expect(parseFixProposal(text, 3)).toEqual({
-      action: 'skip',
-      findingIndex: 3,
-      reason: 'architectural concern',
-    });
-  });
-
-  it('strips ```json fences before parsing', () => {
-    const text = '```json\n{"action":"skip","reason":"no clean fix"}\n```';
-    expect(parseFixProposal(text, 1)).toEqual({
-      action: 'skip',
-      findingIndex: 1,
-      reason: 'no clean fix',
-    });
-  });
-
-  it('returns a "skip" with parse-failure reason when JSON is garbled', () => {
-    expect(parseFixProposal('not json at all', 2)).toEqual({
-      action: 'skip',
-      findingIndex: 2,
-      reason: 'parse failure',
-    });
-  });
-
-  it('returns a "skip" when required replace fields are missing', () => {
-    const text = JSON.stringify({ action: 'replace', replacement: 'x' }); // no startLine/endLine
-    expect(parseFixProposal(text, 4)).toEqual({
-      action: 'skip',
-      findingIndex: 4,
-      reason: 'missing replace fields',
-    });
-  });
-
-  it('returns a "skip" with default reason when action is unknown', () => {
-    const text = JSON.stringify({ action: 'rewrite-everything' });
-    expect(parseFixProposal(text, 5)).toEqual({
-      action: 'skip',
-      findingIndex: 5,
-      reason: 'unknown action',
-    });
   });
 });
 
@@ -243,49 +181,3 @@ describe('buildProviderEnvArgs', () => {
   });
 });
 
-describe('parseFixProposalsBatch', () => {
-  it('splits a multi-finding pi output by chunk separator and parses each section', () => {
-    const sep = '===LGR_CHUNK_SEPARATOR===';
-    const sectionA = JSON.stringify({
-      type: 'message_end',
-      message: { role: 'assistant', content: [{ type: 'text', text: '{"action":"replace","replacement":"a","startLine":1,"endLine":1}' }] },
-    });
-    const sectionB = JSON.stringify({
-      type: 'message_end',
-      message: { role: 'assistant', content: [{ type: 'text', text: '{"action":"skip","reason":"too vague"}' }] },
-    });
-    const output = `${sectionA}\n${sep}\n${sectionB}`;
-
-    const proposals = parseFixProposalsBatch(output, 2);
-
-    expect(proposals).toHaveLength(2);
-    expect(proposals[0]).toMatchObject({ action: 'replace', findingIndex: 0, replacement: 'a' });
-    expect(proposals[1]).toMatchObject({ action: 'skip', findingIndex: 1, reason: 'too vague' });
-  });
-
-  it('fills missing chunks with skip proposals', () => {
-    const sectionA = JSON.stringify({
-      type: 'message_end',
-      message: { role: 'assistant', content: [{ type: 'text', text: '{"action":"skip","reason":"no fix"}' }] },
-    });
-    const proposals = parseFixProposalsBatch(sectionA, 3);
-
-    expect(proposals).toHaveLength(3);
-    expect(proposals[0].action).toBe('skip');
-    expect(proposals[1]).toEqual({ action: 'skip', findingIndex: 1, reason: 'no output' });
-    expect(proposals[2]).toEqual({ action: 'skip', findingIndex: 2, reason: 'no output' });
-  });
-
-  it('treats a chunk with no assistant text as skip', () => {
-    const sep = '===LGR_CHUNK_SEPARATOR===';
-    const sectionA = JSON.stringify({ type: 'chunk', x: 1 }); // no message_end
-    const sectionB = JSON.stringify({
-      type: 'message_end',
-      message: { role: 'assistant', content: [{ type: 'text', text: '{"action":"skip","reason":"no clean fix"}' }] },
-    });
-    const proposals = parseFixProposalsBatch(`${sectionA}\n${sep}\n${sectionB}`, 2);
-
-    expect(proposals[0]).toEqual({ action: 'skip', findingIndex: 0, reason: 'no assistant output' });
-    expect(proposals[1]).toMatchObject({ action: 'skip', findingIndex: 1, reason: 'no clean fix' });
-  });
-});

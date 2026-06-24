@@ -1,17 +1,29 @@
 import { LlmClient } from './llm-client';
 import type { IReviewFinding, IModelUsage, IAuthoredFinding } from '../types';
-import type { IFixProposal } from './pi.service';
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
+import { extractAddedLines } from './diff.utils';
 import {
   FindingsValidationSchema,
   FindingsValidationWithInfoSchema,
   FixValidationSchema,
+  TextFixProposalsSchema,
   findingsValidationJsonSchema,
   findingsValidationWithInfoJsonSchema,
   fixValidationJsonSchema,
+  textFixProposalsJsonSchema,
   parseWithSchema,
 } from './llm-schemas';
+
+/**
+ * A proposed inline ` ```suggestion ` edit for one finding: either a `replace`
+ * spanning a contiguous range of ADDED (new-file) lines, or a `skip`. Produced
+ * by {@link MultiModelValidator.proposeTextFixes} and gated by
+ * {@link MultiModelValidator.validateSuggestions} before posting.
+ */
+export type IFixProposal =
+  | { action: 'replace'; findingIndex: number; replacement: string; startLine: number; endLine: number }
+  | { action: 'skip'; findingIndex: number; reason: string };
 
 export interface IValidatedFinding extends IReviewFinding {
   validationNotes: string;
@@ -600,7 +612,111 @@ export class MultiModelValidator {
   }
 
   /**
-   * Council vote on pi-proposed code suggestions. Same unanimity-with-deliberation
+   * Propose inline ` ```suggestion ` edits for the given findings using one
+   * chat model (no pi runner, no container). Each suggestion may ONLY correct
+   * natural-language text — spelling, grammar and wording in comments,
+   * docstrings, doc/markdown files, and human-facing strings/log messages —
+   * never executable code. The model is shown each finding plus that file's
+   * ADDED lines (with their new-file numbers), and returns either a `replace`
+   * over a contiguous range of those lines or a `skip`.
+   *
+   * Returns exactly one proposal per finding, index-aligned (missing or
+   * malformed entries default to `skip`), so the caller can address proposals
+   * by finding index. Range/added-line correctness is enforced by the caller
+   * (isAddedRange) and the suggestion is gated by {@link validateSuggestions}.
+   */
+  public async proposeTextFixes(
+    findings: IReviewFinding[],
+    fullDiff: string,
+  ): Promise<{ proposals: IFixProposal[]; usage: IModelUsage[] }> {
+    if (this.models.length === 0 || findings.length === 0) {
+      return { proposals: [], usage: [] };
+    }
+
+    const diffLines = fullDiff.split('\n');
+    const addedByFile = new Map<string, Array<{ line: number; content: string }>>();
+    const editableFor = (filePath: string): Array<{ line: number; content: string }> => {
+      const cached = addedByFile.get(filePath);
+      if (cached) return cached;
+      const lines = extractAddedLines(diffLines, filePath);
+      addedByFile.set(filePath, lines);
+      return lines;
+    };
+
+    const items = findings.map((f, i) => ({
+      index: i,
+      file: f.filePath,
+      findingLine: f.line,
+      finding: f.comment.slice(0, 800),
+      editableAddedLines: editableFor(f.filePath).map((l) => ({ line: l.line, text: l.content })),
+    }));
+
+    const system = [
+      'You propose tiny, safe inline suggestion edits for code-review findings.',
+      'You may ONLY fix natural-language text: spelling, grammar and wording in',
+      '  - code comments and docstrings,',
+      '  - documentation / markdown files,',
+      '  - human-facing string literals and log messages.',
+      'You must NEVER change executable code — not identifiers, keywords, operators,',
+      'control flow, function signatures, API names, imports, types, or logic — not even',
+      'to "improve" them. If the only useful fix would touch code, skip.',
+      'For each finding, choose one action:',
+      ' - "replace": the finding is a pure TEXT fix on a contiguous range of the listed',
+      '   editableAddedLines. Set startLine/endLine to new-file line numbers FROM THAT LIST,',
+      '   and replacement to the full corrected text for those lines — preserve all code,',
+      '   indentation and surrounding characters exactly, changing only the natural-language text.',
+      ' - "skip": anything else (a logic/code concern, "consider ...", architectural points,',
+      '   or when the text to fix is not on an editable added line).',
+      'Return JSON {"proposals":[{"index","action","startLine","endLine","replacement","reason"}]}.',
+      'For "skip" set startLine and endLine to 0 and replacement to "". For "replace" set reason to "".',
+    ].join('\n');
+
+    const userMessage = `## Findings and editable lines:\n${JSON.stringify(items, null, 2)}`;
+
+    // Default every finding to skip; the model upgrades the ones it can fix.
+    const proposals: IFixProposal[] = findings.map((_, i) => ({
+      action: 'skip',
+      findingIndex: i,
+      reason: 'no proposal returned',
+    }));
+    const usage: IModelUsage[] = [];
+
+    const model = this.models[0];
+    try {
+      const response = await model.chat(system, userMessage, {
+        jsonMode: true,
+        jsonSchema: textFixProposalsJsonSchema,
+      });
+      usage.push(this.trackUsage(model, response));
+
+      const parsed = parseWithSchema(response.content, TextFixProposalsSchema);
+      if (parsed) {
+        for (const p of parsed.proposals) {
+          if (p.index < 0 || p.index >= findings.length) continue;
+          const isUsableReplace =
+            p.action === 'replace' && p.replacement !== '' && p.startLine > 0 && p.endLine >= p.startLine;
+          if (isUsableReplace) {
+            proposals[p.index] = {
+              action: 'replace',
+              findingIndex: p.index,
+              replacement: p.replacement,
+              startLine: p.startLine,
+              endLine: p.endLine,
+            };
+          } else {
+            proposals[p.index] = { action: 'skip', findingIndex: p.index, reason: p.reason || 'not a text fix' };
+          }
+        }
+      }
+    } catch (err) {
+      LogSink.warn(`Text-fix proposal failed: ${err}`, TraceTags.PI);
+    }
+
+    return { proposals, usage };
+  }
+
+  /**
+   * Council vote on proposed suggestions. Same unanimity-with-deliberation
    * rule as validateFindings: round 1 collects votes, splits go to round 2 with
    * peers' reasoning, and only suggestions that all responding validators approve
    * after round 2 are kept.
@@ -715,16 +831,20 @@ export class MultiModelValidator {
 
     const baseSystem = isRound2
       ? [
-          'You are reconsidering a code suggestion where reviewers disagreed in round 1.',
+          'You are reconsidering a text-only suggestion where reviewers disagreed in round 1.',
           'Other reviewers saw the same proposal and reached different conclusions — read their reasoning.',
-          'Decide whether the proposed replacement is a usable drop-in that fits the surrounding code.',
+          'These suggestions may only correct natural-language text (comments, docstrings, docs, human-facing strings/log messages).',
+          'Approve (relevant=true) ONLY if the replacement changes natural-language text and leaves all executable code byte-for-byte identical, and the correction is accurate.',
+          'Reject (relevant=false) if it alters any code (identifiers, keywords, operators, control flow, signatures, imports, logic) or if the wording fix is wrong.',
           'Return JSON: { "results": [{ "index": 0, "relevant": true/false, "thought": "..." }, ...] }',
         ].join('\n')
       : [
-          'You are a senior code reviewer evaluating a proposed code suggestion.',
-          'For EACH suggestion: decide whether the replacement is a usable drop-in and consistent with the surrounding code style and conventions.',
-          'Be strict — a suggestion is only worth posting if it would actually compile/work and a reasonable maintainer would accept it.',
-          'Add a brief thought (1 sentence) explaining why it fits or why it does not.',
+          'You are a senior reviewer evaluating a proposed text-only suggestion.',
+          'These suggestions may only correct natural-language text: spelling, grammar and wording in comments, docstrings, doc/markdown files, and human-facing string literals/log messages.',
+          'For EACH suggestion, compare the proposedReplacement against the surrounding context line by line.',
+          'Approve (relevant=true) ONLY if it changes natural-language text and leaves all executable code byte-for-byte identical (same indentation and surrounding characters), and the correction is actually right.',
+          'Reject (relevant=false) if it changes any code (identifiers, keywords, operators, control flow, function signatures, imports, types, or logic), introduces a new issue, or the wording fix is incorrect.',
+          'Add a brief thought (1 sentence) explaining why you approve or reject.',
           'Return JSON: { "results": [{ "index": 0, "relevant": true/false, "thought": "..." }, ...] }',
         ].join('\n');
 

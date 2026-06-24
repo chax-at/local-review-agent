@@ -5,6 +5,7 @@ import {
   packDiffPatchesIntoBatches,
   splitFileDiffAtHunks,
   isAddedRange,
+  extractAddedLines,
   isLockfile,
 } from '../../src/reviewer/diff.utils';
 
@@ -151,6 +152,73 @@ describe('isAddedRange', () => {
   it('returns false when a line is missing from the diff entirely', () => {
     // line 99 is past the hunk → unknown → not ADDED
     expect(isAddedRange(diffLines, 'foo.ts', 99, 99)).toBe(false);
+  });
+});
+
+describe('extractAddedLines', () => {
+  const diffLines = [
+    'diff --git a/foo.ts b/foo.ts',
+    '--- a/foo.ts',
+    '+++ b/foo.ts',
+    '@@ -10,2 +10,5 @@',
+    '+const a = 1;',
+    '+const b = 2;',
+    '+const c = 3;',
+    ' const x = 0;',
+    '+const d = 4;',
+  ];
+
+  it('returns each ADDED line with its new-file number and the + stripped', () => {
+    expect(extractAddedLines(diffLines, 'foo.ts')).toEqual([
+      { line: 10, content: 'const a = 1;' },
+      { line: 11, content: 'const b = 2;' },
+      { line: 12, content: 'const c = 3;' },
+      { line: 14, content: 'const d = 4;' },
+    ]);
+  });
+
+  it('ignores context and removed lines', () => {
+    const withRemoval = [
+      'diff --git a/bar.ts b/bar.ts',
+      '--- a/bar.ts',
+      '+++ b/bar.ts',
+      '@@ -5,3 +5,3 @@',
+      ' const keep = 0;',
+      '-const old = 1;',
+      '+const neu = 1;',
+      ' const tail = 2;',
+    ];
+    expect(extractAddedLines(withRemoval, 'bar.ts')).toEqual([{ line: 6, content: 'const neu = 1;' }]);
+  });
+
+  it('spans multiple hunks in the same file', () => {
+    const twoHunks = [
+      'diff --git a/baz.ts b/baz.ts',
+      '--- a/baz.ts',
+      '+++ b/baz.ts',
+      '@@ -1,1 +1,2 @@',
+      ' const a = 1;',
+      '+const b = 2;',
+      '@@ -10,1 +11,2 @@',
+      ' const c = 3;',
+      '+const d = 4;',
+    ];
+    expect(extractAddedLines(twoHunks, 'baz.ts')).toEqual([
+      { line: 2, content: 'const b = 2;' },
+      { line: 12, content: 'const d = 4;' },
+    ]);
+  });
+
+  it('returns an empty array for a file not in the diff', () => {
+    expect(extractAddedLines(diffLines, 'other.ts')).toEqual([]);
+  });
+
+  it('preserves an empty added line (blank insertion)', () => {
+    const blank = ['--- a/q.ts', '+++ b/q.ts', '@@ -1,0 +1,2 @@', '+', '+const a = 1;'];
+    expect(extractAddedLines(blank, 'q.ts')).toEqual([
+      { line: 1, content: '' },
+      { line: 2, content: 'const a = 1;' },
+    ]);
   });
 });
 

@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { MultiModelValidator, pickRandom } from '../../src/reviewer/multi-model-validator';
+import type { IFixProposal } from '../../src/reviewer/multi-model-validator';
 import type { LlmClient } from '../../src/reviewer/llm-client';
 import type { IReviewFinding, IAuthoredFinding } from '../../src/types';
-import type { IFixProposal } from '../../src/reviewer/pi.service';
 
 function mockClient(name: string, response: string): LlmClient {
   return {
@@ -703,5 +703,114 @@ describe('MultiModelValidator — validateSuggestions', () => {
 
     // No fallback approval — better to skip than risk a bad suggestion.
     expect(result.approvedSuggestions.size).toBe(0);
+  });
+
+  it('instructs validators to approve only text fixes and reject code changes', async () => {
+    const yes = '{"results":[{"index":0,"relevant":true,"thought":"fits","infoRequest":""}]}';
+    const m1 = mockClient('M1', yes);
+    const v = new MultiModelValidator([m1]);
+    await v.validateSuggestions([finding1], [replaceProposal(0)], new Map([[0, 'context']]));
+    const system = ((m1.chat as any).mock.calls[0][0] as string).toLowerCase();
+    expect(system).toContain('natural-language text');
+    expect(system).toContain('reject');
+  });
+});
+
+describe('MultiModelValidator — proposeTextFixes', () => {
+  // a.ts: context line 9, then added lines 10 (a comment with typos) and 11.
+  const diff = [
+    'diff --git a/a.ts b/a.ts',
+    '--- a/a.ts',
+    '+++ b/a.ts',
+    '@@ -9,1 +9,3 @@',
+    ' const x = 0;',
+    '+// recieve the paylod',
+    '+const y = 1;',
+  ].join('\n');
+
+  const typoFinding: IReviewFinding = {
+    filePath: 'a.ts',
+    line: 10,
+    severity: 'note',
+    comment: "Typo in comment: 'recieve' and 'paylod'.",
+  };
+  const logicFinding: IReviewFinding = {
+    filePath: 'a.ts',
+    line: 11,
+    severity: 'concern',
+    comment: 'This assignment should be guarded against null.',
+  };
+
+  it('returns no proposals when no models are configured', async () => {
+    const v = new MultiModelValidator([]);
+    const result = await v.proposeTextFixes([typoFinding], diff);
+    expect(result.proposals).toEqual([]);
+    expect(result.usage).toEqual([]);
+  });
+
+  it('returns no proposals when there are no findings', async () => {
+    const v = new MultiModelValidator([mockClient('M1', '{}')]);
+    const result = await v.proposeTextFixes([], diff);
+    expect(result.proposals).toEqual([]);
+  });
+
+  it('maps a replace response to a replace proposal anchored on the added line', async () => {
+    const resp =
+      '{"proposals":[{"index":0,"action":"replace","startLine":10,"endLine":10,"replacement":"// receive the payload","reason":""}]}';
+    const v = new MultiModelValidator([mockClient('M1', resp)]);
+    const result = await v.proposeTextFixes([typoFinding], diff);
+    expect(result.proposals).toEqual([
+      { action: 'replace', findingIndex: 0, replacement: '// receive the payload', startLine: 10, endLine: 10 },
+    ]);
+  });
+
+  it('maps a skip response to a skip proposal', async () => {
+    const resp =
+      '{"proposals":[{"index":0,"action":"skip","startLine":0,"endLine":0,"replacement":"","reason":"not a text fix"}]}';
+    const v = new MultiModelValidator([mockClient('M1', resp)]);
+    const result = await v.proposeTextFixes([logicFinding], diff);
+    expect(result.proposals).toEqual([{ action: 'skip', findingIndex: 0, reason: 'not a text fix' }]);
+  });
+
+  it('defaults a finding the model omits to a skip', async () => {
+    const resp =
+      '{"proposals":[{"index":0,"action":"replace","startLine":10,"endLine":10,"replacement":"// receive the payload","reason":""}]}';
+    const v = new MultiModelValidator([mockClient('M1', resp)]);
+    const result = await v.proposeTextFixes([typoFinding, logicFinding], diff);
+    expect(result.proposals).toHaveLength(2);
+    expect(result.proposals[0].action).toBe('replace');
+    expect(result.proposals[1].action).toBe('skip');
+  });
+
+  it('skips every finding when the model returns malformed JSON', async () => {
+    const v = new MultiModelValidator([mockClient('M1', 'not json at all')]);
+    const result = await v.proposeTextFixes([typoFinding, logicFinding], diff);
+    expect(result.proposals.map((p) => p.action)).toEqual(['skip', 'skip']);
+  });
+
+  it('skips every finding when the model call throws', async () => {
+    const m1 = { name: 'M1', inputCostPer1M: 1, outputCostPer1M: 2, chat: vi.fn().mockRejectedValue(new Error('net')) } as any;
+    const v = new MultiModelValidator([m1]);
+    const result = await v.proposeTextFixes([typoFinding], diff);
+    expect(result.proposals).toEqual([{ action: 'skip', findingIndex: 0, reason: expect.any(String) }]);
+  });
+
+  it('tracks token usage for the proposing model', async () => {
+    const resp = '{"proposals":[{"index":0,"action":"skip","startLine":0,"endLine":0,"replacement":"","reason":"x"}]}';
+    const v = new MultiModelValidator([mockClient('M1', resp)]);
+    const result = await v.proposeTextFixes([typoFinding], diff);
+    expect(result.usage).toHaveLength(1);
+    expect(result.usage[0].modelName).toBe('M1');
+  });
+
+  it('feeds the editable added lines (number + content) to the model', async () => {
+    const m1 = mockClient('M1', '{"proposals":[]}');
+    const v = new MultiModelValidator([m1]);
+    await v.proposeTextFixes([typoFinding], diff);
+    const userMessage = (m1.chat as any).mock.calls[0][1] as string;
+    expect(userMessage).toContain('recieve the paylod');
+    expect(userMessage).toContain('10');
+    // The unchanged context line is NOT offered as editable.
+    expect(userMessage).not.toContain('const x = 0;');
   });
 });

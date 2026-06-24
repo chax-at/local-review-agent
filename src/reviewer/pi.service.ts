@@ -142,10 +142,6 @@ export interface IPiTokenUsage {
   outputTokens: number;
 }
 
-export type IFixProposal =
-  | { action: 'replace'; findingIndex: number; replacement: string; startLine: number; endLine: number }
-  | { action: 'skip'; findingIndex: number; reason: string };
-
 export function mergeUsage(a: IPiTokenUsage, b: IPiTokenUsage): IPiTokenUsage {
   return { inputTokens: a.inputTokens + b.inputTokens, outputTokens: a.outputTokens + b.outputTokens };
 }
@@ -242,22 +238,6 @@ export function aggregateUsageFromPiOutput(output: string): IPiTokenUsage {
   return { inputTokens, outputTokens };
 }
 
-function extractLastAssistantText(output: string): string | null {
-  const lines = output.trim().split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const event = JSON.parse(lines[i].trim());
-      if (event.type === 'message_end' && event.message?.role === 'assistant') {
-        const text = extractTextContent(event.message);
-        if (text) return text;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
 export interface IPiReviewResult {
   findings: IReviewFinding[];
   usage: IPiTokenUsage;
@@ -283,75 +263,6 @@ function extractFindings(output: string): IReviewFinding[] {
   }
 
   return parsePiFindings(output);
-}
-
-/** Parse a single pi assistant-text response into an IFixProposal. */
-export function parseFixProposal(text: string, findingIndex: number): IFixProposal {
-  let s = text.trim();
-  const fence = /^```(?:json)?\s*\n?([\s\S]*?)```$/m.exec(s);
-  if (fence) s = fence[1].trim();
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(s);
-  } catch {
-    return { action: 'skip', findingIndex, reason: 'parse failure' };
-  }
-
-  if (parsed?.action === 'skip') {
-    return {
-      action: 'skip',
-      findingIndex,
-      reason: typeof parsed.reason === 'string' ? parsed.reason : 'no reason given',
-    };
-  }
-
-  if (parsed?.action === 'replace') {
-    if (
-      typeof parsed.replacement !== 'string' ||
-      typeof parsed.startLine !== 'number' ||
-      typeof parsed.endLine !== 'number'
-    ) {
-      return { action: 'skip', findingIndex, reason: 'missing replace fields' };
-    }
-    return {
-      action: 'replace',
-      findingIndex,
-      replacement: parsed.replacement,
-      startLine: parsed.startLine,
-      endLine: parsed.endLine,
-    };
-  }
-
-  return { action: 'skip', findingIndex, reason: 'unknown action' };
-}
-
-/**
- * Parse a multi-finding pi container output (sections separated by CHUNK_SEPARATOR)
- * into one IFixProposal per expected finding (in input order).
- *
- * Missing or malformed sections become `skip` proposals so the caller always
- * gets exactly `expectedCount` entries indexed 0..expectedCount-1.
- */
-export function parseFixProposalsBatch(output: string, expectedCount: number): IFixProposal[] {
-  const sections = output.split(CHUNK_SEPARATOR);
-  const proposals: IFixProposal[] = [];
-
-  for (let i = 0; i < expectedCount; i++) {
-    const section = sections[i];
-    if (!section || !section.trim()) {
-      proposals.push({ action: 'skip', findingIndex: i, reason: 'no output' });
-      continue;
-    }
-    const text = extractLastAssistantText(section);
-    if (!text) {
-      proposals.push({ action: 'skip', findingIndex: i, reason: 'no assistant output' });
-      continue;
-    }
-    proposals.push(parseFixProposal(text, i));
-  }
-
-  return proposals;
 }
 
 /**
@@ -485,80 +396,6 @@ export class PiService {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
-  }
-
-  /**
-   * Ask pi for a code-replacement suggestion (or skip) for each kept finding.
-   * Mirrors reviewBatch's pattern: one Docker container, pi runs once per
-   * finding inside, output sections separated by CHUNK_SEPARATOR.
-   *
-   * Pi has read-only access to the repo so it can read related files when
-   * deciding the replacement.
-   */
-  public proposeFixes(
-    findings: IReviewFinding[],
-    repoDir: string,
-    dockerImageOverride?: string,
-  ): { proposals: IFixProposal[]; usage: IPiTokenUsage } {
-    if (findings.length === 0) {
-      return { proposals: [], usage: { inputTokens: 0, outputTokens: 0 } };
-    }
-
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-propose-'));
-    try {
-      for (let i = 0; i < findings.length; i++) {
-        fs.writeFileSync(path.join(tmpDir, `finding-${i}.json`), JSON.stringify(findings[i], null, 2));
-      }
-
-      const prompt = [
-        'You are proposing a concrete code replacement for one PR review finding.',
-        'The finding JSON is in the file you were given. Read it.',
-        'You may use your read tool to read related files in /repo for context.',
-        'Decide: does this finding map to a clear, single-range code replacement on RIGHT-side ADDED diff lines?',
-        'If yes: respond with ONLY this JSON object:',
-        '  {"action":"replace","replacement":"<full replacement text including newlines>","startLine":<first line number>,"endLine":<last line number>}',
-        'startLine and endLine are NEW-FILE line numbers (post-PR). They must cover only ADDED lines from the diff.',
-        'replacement should be the COMPLETE replacement text for that range — what should appear on those lines after the suggestion is applied.',
-        'If no clear replacement (architectural concern, "consider X", anything not directly fixable as a code edit):',
-        '  {"action":"skip","reason":"<one-sentence reason>"}',
-        'Return ONLY the JSON object. No prose, no markdown fences.',
-      ].join(' ');
-
-      const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --tools read,bash`;
-      const script = this.buildProposeScript(piBase, prompt, findings.length);
-      fs.writeFileSync(path.join(tmpDir, 'run.sh'), script);
-
-      LogSink.info(`Invoking pi for fix proposals (Docker, ${findings.length} finding(s))...`, TraceTags.PI);
-      const timeout = this.timeoutMs + DOCKER_INSTALL_BUFFER_MS + findings.length * PER_CHUNK_TIMEOUT_MS;
-      const output = this.dockerRun({
-        mounts: [
-          { host: tmpDir, container: '/workspace' },
-          { host: path.resolve(repoDir), container: '/repo', readonly: true },
-        ],
-        workdir: '/repo',
-        imageOverride: dockerImageOverride,
-        timeout,
-      });
-
-      assertPiProducedResponse(output);
-
-      const usage = aggregateUsageFromPiOutput(output);
-      const proposals = parseFixProposalsBatch(output, findings.length);
-      return { proposals, usage };
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  }
-
-  private buildProposeScript(piBase: string, prompt: string, findingCount: number): string {
-    const lines = ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')'];
-
-    for (let i = 0; i < findingCount; i++) {
-      if (i > 0) lines.push(`echo "${CHUNK_SEPARATOR}"`);
-      lines.push(`${piBase} @/workspace/finding-${i}.json "$PROMPT" || true`);
-    }
-
-    return lines.join('\n');
   }
 
   /**
