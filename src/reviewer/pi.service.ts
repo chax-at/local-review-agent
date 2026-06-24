@@ -31,13 +31,24 @@ export function parsePiFindings(output: string): IReviewFinding[] {
   let parsed: any;
   try {
     parsed = JSON.parse(output);
-  } catch {
+  } catch (err) {
     LogSink.warn('Failed to parse pi output as JSON', TraceTags.PI);
+    appendErrorLog([
+      'context: review model returned text that is not valid findings JSON (0 findings extracted)',
+      `detail: ${err instanceof Error ? err.message : String(err)}`,
+      '--- offending model output (truncated to 4000 chars) ---',
+      output.trim().slice(0, 4000) || '(empty)',
+    ]);
     return [];
   }
 
   if (!parsed.findings || !Array.isArray(parsed.findings)) {
     LogSink.warn('pi output has no findings array', TraceTags.PI);
+    appendErrorLog([
+      'context: review model returned JSON with no findings array (0 findings extracted)',
+      '--- offending model output (truncated to 4000 chars) ---',
+      output.trim().slice(0, 4000) || '(empty)',
+    ]);
     return [];
   }
 
@@ -66,6 +77,52 @@ const DOCKER_INSTALL_BUFFER_MS = 30000;
 
 /** Extra time per chunk when batching reviews */
 const PER_CHUNK_TIMEOUT_MS = 60000;
+
+/** Synchronous sleep — dockerRun is sync, so it can't await between read retries. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Append a timestamped diagnostic block to data/error.log (best-effort).
+ *
+ * Failures here would otherwise surface only as a one-line `Warn` the operator
+ * is unlikely to be watching, so the underlying detail is recorded to disk for
+ * after-the-fact inspection. A logging failure must never mask the original
+ * problem, so everything is swallowed.
+ */
+function appendErrorLog(lines: string[]): void {
+  try {
+    const dir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const block = [`===== ${new Date().toISOString()} =====`, ...lines, '', ''].join('\n');
+    fs.appendFileSync(path.join(dir, 'error.log'), block);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Record a Docker-run failure with docker's own stdout/stderr + exit status. */
+function appendDockerErrorLog(record: {
+  context: string;
+  command: string;
+  exitStatus: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+  detail: string;
+}): void {
+  appendErrorLog([
+    `context: ${record.context}`,
+    `detail: ${record.detail}`,
+    `exit: status=${record.exitStatus ?? 'n/a'} signal=${record.signal ?? 'n/a'}`,
+    `command: ${record.command}`,
+    '--- docker stdout ---',
+    record.stdout.trim() || '(empty)',
+    '--- docker stderr ---',
+    record.stderr.trim() || '(empty)',
+  ]);
+}
 
 function extractTextContent(message: any): string | null {
   // pi returns content as an array of {type, text/thinking} objects
@@ -124,9 +181,15 @@ function normalizeUsageObject(u: Record<string, unknown>): { input: number; outp
  * the chunk-tolerant batch script would otherwise treat as "no findings":
  *  - container-level failures (e.g. `pi: not found`, missing API key) that
  *    emit zero `message_end` events;
- *  - provider-level failures (e.g. a 404 from a base-URL/provider mismatch)
- *    where every `message_end` carries `stopReason: 'error'` and empty
- *    content. A successful response on any call is enough to pass.
+ *  - provider-level failures (e.g. a 404 from a base-URL/provider mismatch, or
+ *    a 400 from a deprecated request parameter) where the assistant
+ *    `message_end` carries `stopReason: 'error'` and empty content. A
+ *    successful assistant response on any call is enough to pass.
+ *
+ * Only `role: 'assistant'` message_end events count. pi also emits a `user`
+ * message_end (the echoed prompt) with no `stopReason` — treating that as
+ * success masks an assistant turn that actually errored, degrading a hard
+ * provider failure into a silent "no findings".
  */
 export function assertPiProducedResponse(output: string): void {
   let lastError: string | null = null;
@@ -136,9 +199,9 @@ export function assertPiProducedResponse(output: string): void {
     try {
       const e = JSON.parse(t) as {
         type?: string;
-        message?: { stopReason?: string; errorMessage?: string };
+        message?: { role?: string; stopReason?: string; errorMessage?: string };
       } | null;
-      if (!e || e.type !== 'message_end') continue;
+      if (!e || e.type !== 'message_end' || e.message?.role !== 'assistant') continue;
       if (e.message?.stopReason === 'error') {
         lastError = e.message.errorMessage ?? 'unknown error';
         continue;
@@ -685,9 +748,56 @@ export class PiService {
     LogSink.debug(`Docker: docker ${logArgs.join(' ')}`, TraceTags.PI);
 
     const timeout = opts.timeout ?? this.timeoutMs + DOCKER_INSTALL_BUFFER_MS;
-    execFileSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' });
 
-    const output = fs.readFileSync(outHost, 'utf-8');
+    // Capture docker's own stdout/stderr + exit so a failure isn't reduced to a
+    // bare ENOENT below. With the in-container redirect, docker's stdout is
+    // normally empty; daemon-level errors (image pull, mount failure, non-zero
+    // exit, timeout kill) land on stderr/the thrown error.
+    let dockerStdout = '';
+    let dockerStderr = '';
+    try {
+      dockerStdout = execFileSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' }) ?? '';
+    } catch (err: any) {
+      dockerStdout = typeof err?.stdout === 'string' ? err.stdout : '';
+      dockerStderr = typeof err?.stderr === 'string' ? err.stderr : '';
+      appendDockerErrorLog({
+        context: `docker run failed (model=${this.model}, provider=${this.provider}, image=${image})`,
+        command: `docker ${logArgs.join(' ')}`,
+        exitStatus: typeof err?.status === 'number' ? err.status : null,
+        signal: err?.signal ?? null,
+        stdout: dockerStdout,
+        stderr: dockerStderr,
+        detail: err?.killed ? `process killed (timeout ${timeout}ms or signal)` : String(err?.message ?? err),
+      });
+      throw err;
+    }
+
+    // The container writes the redirect file onto a bind mount; under some Docker
+    // backends (notably WSL2) the host view can lag a beat behind container exit.
+    // Retry the read briefly before treating a missing file as a real failure.
+    const READ_ATTEMPTS = 4;
+    let output: string | null = null;
+    for (let attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
+      try {
+        output = fs.readFileSync(outHost, 'utf-8');
+        break;
+      } catch {
+        sleepSync(250);
+      }
+    }
+
+    if (output === null) {
+      appendDockerErrorLog({
+        context: `docker exited cleanly but ${outLogName} was never produced (model=${this.model}, provider=${this.provider}, image=${image})`,
+        command: `docker ${logArgs.join(' ')}`,
+        exitStatus: 0,
+        signal: null,
+        stdout: dockerStdout,
+        stderr: dockerStderr,
+        detail: `output file still missing on host after ${READ_ATTEMPTS} read attempts: ${outHost}`,
+      });
+      throw new Error(`pi produced no output file (${outLogName}) despite a clean docker exit; see data/error.log`);
+    }
 
     // Dump last pi output to data/ for debugging (best-effort)
     try {

@@ -165,12 +165,29 @@ describe('assertPiProducedResponse', () => {
     expect(() => assertPiProducedResponse(output)).not.toThrow();
   });
 
-  it('does not throw when output contains message_end mixed with other lines', () => {
+  it('does not throw when an assistant message_end is mixed with other lines', () => {
     const output = [
       '{"type":"chunk","x":1}',
-      JSON.stringify({ type: 'message_end', usage: { input: 10, output: 5 } }),
+      JSON.stringify({
+        type: 'message_end',
+        message: { role: 'assistant', content: [{ type: 'text', text: '{"findings":[]}' }] },
+        usage: { input: 10, output: 5 },
+      }),
     ].join('\n');
     expect(() => assertPiProducedResponse(output)).not.toThrow();
+  });
+
+  it('throws when the only message_end is the user prompt echo (no assistant turn)', () => {
+    // Regression: a `user` message_end has no stopReason; counting it as success
+    // masks an assistant turn that errored (e.g. a 400 from a deprecated param).
+    const output = [
+      JSON.stringify({ type: 'message_end', message: { role: 'user', content: [] } }),
+      JSON.stringify({
+        type: 'message_end',
+        message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '400 bad param' },
+      }),
+    ].join('\n');
+    expect(() => assertPiProducedResponse(output)).toThrowError(/400 bad param/);
   });
 
   it('throws and surfaces the error when every message_end is a provider error', () => {
