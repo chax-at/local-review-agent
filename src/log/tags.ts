@@ -7,6 +7,4 @@ export const TraceTags = {
   PI: 'pi',
   STATE: 'state',
   ERROR: 'error',
-  BAMBOO: 'bamboo',
-  AUDIT: 'audit',
 } as const;

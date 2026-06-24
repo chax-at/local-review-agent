@@ -39,7 +39,7 @@ export class GitService {
   private readonly fetchedRepos = new Set<string>();
 
   constructor(workDir: string, gitConfig: IGitConfig) {
-    // Resolve to absolute so Docker volume mounts (audit npm install) work
+    // Resolve to absolute so Docker volume mounts (pi runner) work
     // — relative paths like "./repos" are rejected as invalid volume names.
     this.workDir = path.resolve(workDir);
     this.gitConfig = gitConfig;

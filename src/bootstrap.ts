@@ -15,11 +15,6 @@ import { MultiModelValidator } from './reviewer/multi-model-validator';
 import { InfoGatherer } from './reviewer/info-gatherer';
 import { FindingDeduplicator } from './reviewer/finding-deduplicator';
 import { CarrotConfigService } from './config/carrot-config.service';
-import { AuditService } from './audit/audit.service';
-import { NpmRegistryClient } from './audit/npm-registry.client';
-import { ChangelogService } from './audit/changelog.service';
-import { BambooStateService } from './bamboo/bamboo.state.service';
-import { BambooPollerService } from './bamboo/bamboo.poller.service';
 import { MentionRouter } from './poller/mention-router';
 import { parseRoles, assertCorrectnessCovered } from './reviewer/personas';
 
@@ -43,7 +38,6 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   ensurePiRunnerImage();
 
   const intervalMs = config.get('Polling.IntervalMs');
-  const bambooIntervalMs = config.get('AuditPoller.PollingIntervalMs');
   const maxDiffLines = config.get('Review.MaxDiffLines');
   const maxFileLines = config.get('Review.MaxFileLines');
   const maxInfoTokens = config.get('Review.MaxInfoTokens');
@@ -55,10 +49,7 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     `Config: bot=${botUsername} interval=${intervalMs}ms maxDiffLines=${maxDiffLines} maxFileLines=${maxFileLines}`,
     TraceTags.DEBUG,
   );
-  LogSink.debug(
-    `Config: workDir=${workDir} dataDir=${dataDir} auditPollerInterval=${bambooIntervalMs}ms`,
-    TraceTags.DEBUG,
-  );
+  LogSink.debug(`Config: workDir=${workDir} dataDir=${dataDir}`, TraceTags.DEBUG);
 
   const stateService = new StateService(dataDir);
   const gitService = new GitService(workDir, gitConfig);
@@ -124,31 +115,6 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     LogSink.warn('No review-enabled models configured — PR review and fixes are disabled.', TraceTags.PI);
   }
 
-  const loadSummarizer = (): LlmClient | null => {
-    const sApiKey = config.get('Summarizer.ApiKey');
-    const sApiBase = config.get('Summarizer.ApiBase');
-    const sModel = config.get('Summarizer.Model');
-    if (!sApiKey || !sApiBase || !sModel) return null;
-    const authHeader = config.get('Summarizer.AuthHeader') || undefined;
-    return new LlmClient({
-      name: config.get('Summarizer.Name') || 'Summarizer',
-      apiKey: sApiKey,
-      apiBase: sApiBase,
-      model: sModel,
-      authHeader,
-      supportsStructuredOutput: config.get('Summarizer.SupportsStructuredOutput'),
-      maxTokenParam: config.get('Summarizer.MaxTokenParam') as ILlmConfig['maxTokenParam'],
-      inputCostPer1M: config.get('Summarizer.InputTokenCostPer1M'),
-      outputCostPer1M: config.get('Summarizer.OutputTokenCostPer1M'),
-    });
-  };
-  const summarizer = loadSummarizer();
-  if (summarizer) {
-    LogSink.info(`Summarizer model: ${summarizer.name}`, TraceTags.DEBUG);
-  } else {
-    LogSink.warn('Summarizer not configured — changelog summaries will be skipped', TraceTags.DEBUG);
-  }
-
   const multiValidator = new MultiModelValidator(validators);
   // Info-gatherer runs once per PR before validation, asking the first available
   // validator what extra files/symbols would help judge the findings.
@@ -170,7 +136,7 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const routerLlmChain: LlmClient[] = [...validators];
   const mentionRouter = new MentionRouter(routerLlmChain);
 
-  const pingTargets = [...validators, ...(summarizer ? [summarizer] : [])];
+  const pingTargets = [...validators];
   if (pingTargets.length > 0) {
     LogSink.info('Checking LLM connectivity...', TraceTags.DEBUG);
     const pingResults = await Promise.allSettled(pingTargets.map((v) => v.ping()));
@@ -199,20 +165,6 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     deduplicator,
     maxValidators,
   );
-  const npmRegistry = new NpmRegistryClient();
-  const changelogService = new ChangelogService(npmRegistry, summarizer);
-  const auditService = new AuditService(npmRegistry);
-
-  const bambooState = new BambooStateService(dataDir);
-  const bambooPoller = new BambooPollerService({
-    state: bambooState,
-    audit: auditService,
-    provider,
-    carrotConfig: carrotConfigService,
-    git: gitService,
-    intervalMs: bambooIntervalMs,
-    changelog: changelogService,
-  });
 
   const heartbeatPath = path.join(dataDir, 'heartbeat');
   const poller = new PollerService(
@@ -220,19 +172,16 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     stateService,
     reviewerService,
     carrotConfigService,
-    auditService,
     gitService,
     mentionRouter,
     botUsername,
     intervalMs,
     heartbeatPath,
-    () => bambooPoller.pollCycle(),
   );
 
   const shutdown = (): void => {
     LogSink.info('Shutdown signal received...', TraceTags.DEBUG);
     poller.shutdown();
-    bambooPoller.shutdown();
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
@@ -241,6 +190,5 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     LogSink.error(`Unhandled Rejection: ${reason}`, TraceTags.ERROR);
   });
 
-  bambooPoller.start();
   await poller.start();
 }

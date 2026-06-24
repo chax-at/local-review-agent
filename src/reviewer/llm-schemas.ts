@@ -95,7 +95,7 @@ export const infoActionsJsonSchema = toJsonSchema(InfoActionsSchema, 'info_actio
 
 /** Schema for LLM-routed mention intent detection */
 export const MentionRouteSchema = z.object({
-  tool: z.enum(['fix', 'autofix', 'revert', 'review', 'audit_fix', 'explain', 'reply', 'ignore']),
+  tool: z.enum(['fix', 'autofix', 'revert', 'review', 'explain', 'reply', 'ignore']),
   message: z.string(),
   reasoning: z.string(),
 });

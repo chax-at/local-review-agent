@@ -9,7 +9,6 @@ describe('executeMentionTool', () => {
       reviewPr: vi.fn(),
     },
     handleRevert: vi.fn().mockResolvedValue('reverted'),
-    handleAuditFix: vi.fn(),
     postReply: vi.fn(),
     pr: { project: 'P', slug: 'R', prId: 1, sourceBranch: 'feature', targetBranch: 'main' },
   }) as any;
@@ -41,12 +40,6 @@ describe('executeMentionTool', () => {
     const deps = makeDeps();
     await executeMentionTool(route('review') as any, baseMention, deps);
     expect(deps.reviewer.reviewPr).toHaveBeenCalled();
-  });
-
-  it('dispatches audit_fix to handleAuditFix', async () => {
-    const deps = makeDeps();
-    await executeMentionTool(route('audit_fix') as any, baseMention, deps);
-    expect(deps.handleAuditFix).toHaveBeenCalled();
   });
 
   it('dispatches explain to postReply', async () => {

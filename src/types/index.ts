@@ -52,7 +52,7 @@ export interface IDiffChunk {
   lineCount: number;
 }
 
-export type MentionTool = 'fix' | 'autofix' | 'revert' | 'review' | 'audit_fix' | 'explain' | 'reply' | 'ignore';
+export type MentionTool = 'fix' | 'autofix' | 'revert' | 'review' | 'explain' | 'reply' | 'ignore';
 
 export interface IMentionCommand {
   type: MentionTool;
@@ -66,43 +66,6 @@ export interface IMentionCommand {
   anchorLine?: number;
   /** Sibling replies in the thread (for context) */
   siblingReplies?: string[];
-}
-
-export type BambooBuildStatus = 'checked_ok' | 'audit_detected' | 'fix_applied';
-
-export interface IBambooBuildState {
-  checkedAt: string;
-  state: string;
-  auditIssue: boolean;
-  prProject?: string;
-  prSlug?: string;
-  prId?: number;
-  prBranch?: string;
-  status: BambooBuildStatus;
-  vulnerabilities?: unknown[];
-}
-
-export interface IAuditPrTracker {
-  /** The audit branch name (e.g. "audit/2026.03.22-19.30") */
-  auditBranch: string;
-  /** Bitbucket PR ID */
-  prId: number;
-  /** Target branch this audit PR merges into */
-  targetBranch: string;
-  /** Project key */
-  project: string;
-  /** Repo slug */
-  slug: string;
-  /** When the audit PR was created or last updated */
-  lastUpdated: string;
-}
-
-export interface IBambooState {
-  builds: Record<string, IBambooBuildState>;
-  /** Open audit fix PRs, keyed by "PROJECT/slug:targetBranch" */
-  auditPrs?: Record<string, IAuditPrTracker>;
-  /** Last scheduled audit check per "PROJECT/slug:branch" */
-  scheduledAudits?: Record<string, string>;
 }
 
 export interface IModelUsage {

@@ -11,7 +11,6 @@ vi.mock('fs', () => ({
 }));
 
 import { PollerService } from '../../src/poller/poller.service';
-import { BambooPollerService } from '../../src/bamboo/bamboo.poller.service';
 
 describe('poll cycle fetch-memo wiring', () => {
   let git: { resetFetchMemo: ReturnType<typeof vi.fn> };
@@ -45,7 +44,6 @@ describe('poll cycle fetch-memo wiring', () => {
       state as never,
       {} as never, // reviewer — unused with no projects
       carrotConfig as never,
-      {} as never, // audit — unused with no projects
       git as never,
       {} as never, // router — unused with no projects
       'bot',
@@ -53,22 +51,6 @@ describe('poll cycle fetch-memo wiring', () => {
       '/tmp/heartbeat',
     );
     await (poller as unknown as { pollCycle(): Promise<void> }).pollCycle();
-    expect(git.resetFetchMemo).toHaveBeenCalled();
-    expect(git.resetFetchMemo.mock.invocationCallOrder[0]).toBeLessThan(
-      provider.listProjects.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('BambooPollerService.pollCycle clears the git fetch memo before polling', async () => {
-    const bamboo = new BambooPollerService({
-      state: state as never,
-      audit: {} as never, // unused with no projects
-      provider: provider as never,
-      carrotConfig: carrotConfig as never,
-      git: git as never,
-      intervalMs: 1000,
-    });
-    await bamboo.pollCycle();
     expect(git.resetFetchMemo).toHaveBeenCalled();
     expect(git.resetFetchMemo.mock.invocationCallOrder[0]).toBeLessThan(
       provider.listProjects.mock.invocationCallOrder[0],
@@ -124,7 +106,6 @@ describe('poll cycle persists review state per PR (survives mid-cycle kill)', ()
       state as never,
       reviewer as never,
       carrotConfig as never,
-      {} as never, // audit
       git as never,
       {} as never, // router
       'bot',

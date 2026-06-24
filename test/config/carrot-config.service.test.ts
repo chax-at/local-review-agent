@@ -31,24 +31,8 @@ describe('parseCarrotConfig', () => {
   it('applies defaults for missing fields', () => {
     const config = parseCarrotConfig('{ "prReview": true }');
     expect(config).not.toBeNull();
-    expect(config!.packages).toEqual(['.']);
     expect(config!.prReview).toBe(true);
-    expect(config!.bambooFix).toBe(false);
-    expect(config!.fixDelivery).toBe('protected-only');
-    expect(config!.protectedBranches).toEqual(['main', 'master', 'release/*']);
-  });
-
-  it('accepts bambooFix without auditChannel', () => {
-    const config = parseCarrotConfig('{ "bambooFix": true }');
-    expect(config).not.toBeNull();
-    expect(config!.bambooFix).toBe(true);
-  });
-
-  it('accepts bambooFix with all fields', () => {
-    const config = parseCarrotConfig('{ "bambooFix": true, "packages": [".", "frontend"] }');
-    expect(config).not.toBeNull();
-    expect(config!.bambooFix).toBe(true);
-    expect(config!.packages).toEqual(['.', 'frontend']);
+    expect(config!.rulesFiles).toEqual(['CLAUDE.md', 'AGENTS.md']);
   });
 
   it('strips JSONC comments before parsing', () => {

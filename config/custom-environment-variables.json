@@ -105,16 +105,5 @@
         "Port": "DIAGNOSTICS_LOGGING_GELF_PORT"
       }
     }
-  },
-  "Summarizer": {
-    "ApiKey": "SUMMARIZER_API_KEY",
-    "ApiBase": "SUMMARIZER_API_BASE",
-    "Model": "SUMMARIZER_MODEL",
-    "Name": "SUMMARIZER_NAME",
-    "AuthHeader": "SUMMARIZER_AUTH_HEADER",
-    "SupportsStructuredOutput": { "__name": "SUMMARIZER_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
-    "MaxTokenParam": "SUMMARIZER_MAX_TOKEN_PARAM",
-    "InputTokenCostPer1M": { "__name": "SUMMARIZER_INPUT_COST", "__format": "number" },
-    "OutputTokenCostPer1M": { "__name": "SUMMARIZER_OUTPUT_COST", "__format": "number" }
   }
 }

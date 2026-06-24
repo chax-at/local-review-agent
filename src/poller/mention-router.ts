@@ -15,7 +15,6 @@ const TOOL_DESCRIPTIONS = [
   'autofix — fix all review findings (collects bot review comments, runs lint)',
   'revert — create a revert PR for a commit the user specifies',
   'review — re-run full PR code review',
-  'audit_fix — run npm audit and apply safe dependency overrides',
   'explain — answer a question about the code or a bot finding',
   'reply — acknowledge, clarify, or respond conversationally',
   'ignore — no action needed (noise, thanks, accidental tag)',

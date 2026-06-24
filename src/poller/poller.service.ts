@@ -8,7 +8,6 @@ import type { IPullRequest } from '../provider/provider.types';
 import { StateService } from './state.service';
 import { ReviewerService } from '../reviewer/reviewer.service';
 import { CarrotConfigService } from '../config/carrot-config.service';
-import { AuditService } from '../audit/audit.service';
 import { GitService } from '../reviewer/git.service';
 import type { IMentionCommand } from '../types';
 import { REPO_ACTIVITY_WINDOW_MS, repoHasRecentActivity } from './repo-activity';
@@ -33,13 +32,11 @@ export class PollerService {
   private readonly state: StateService;
   private readonly reviewer: ReviewerService;
   private readonly carrotConfig: CarrotConfigService;
-  private readonly audit: AuditService;
   private readonly git: GitService;
   private readonly router: MentionRouter;
   private readonly botUsername: string;
   private readonly intervalMs: number;
   private readonly heartbeatPath: string;
-  private readonly onCycleEnd?: () => Promise<void>;
   private shutdownRequested = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -48,25 +45,21 @@ export class PollerService {
     state: StateService,
     reviewer: ReviewerService,
     carrotConfig: CarrotConfigService,
-    audit: AuditService,
     git: GitService,
     router: MentionRouter,
     botUsername: string,
     intervalMs: number,
     heartbeatPath: string,
-    onCycleEnd?: () => Promise<void>,
   ) {
     this.provider = provider;
     this.state = state;
     this.reviewer = reviewer;
     this.carrotConfig = carrotConfig;
-    this.audit = audit;
     this.git = git;
     this.router = router;
     this.botUsername = botUsername;
     this.intervalMs = intervalMs;
     this.heartbeatPath = heartbeatPath;
-    this.onCycleEnd = onCycleEnd;
   }
 
   public async start(): Promise<void> {
@@ -100,13 +93,6 @@ export class PollerService {
 
   private async runOneCycle(): Promise<void> {
     await this.pollCycle();
-    if (this.onCycleEnd) {
-      try {
-        await this.onCycleEnd();
-      } catch (err) {
-        LogSink.error(`onCycleEnd hook threw: ${err}`, TraceTags.POLLER);
-      }
-    }
   }
 
   private async pollCycle(): Promise<void> {
@@ -332,7 +318,6 @@ export class PollerService {
       const result = await executeMentionTool(route, mention, {
         reviewer: this.reviewer,
         handleRevert: (msg) => this.handleRevert(project, slug, pr.id, pr.sourceBranch, msg),
-        handleAuditFix: () => this.handleAuditFix(project, slug, pr.id, pr.sourceBranch, carrotConf),
         postReply: async (text) => {
           if (mention.commentId) {
             await this.provider.replyToComment(project, slug, pr.id, mention.commentId, text);
@@ -390,72 +375,6 @@ export class PollerService {
       lastActivityId: maxActivityId,
       processedMentionIds: allProcessed.length > 0 ? allProcessed : undefined,
     });
-  }
-
-  private async handleAuditFix(
-    project: string,
-    slug: string,
-    prId: number,
-    branch: string,
-    carrotConf: { packages: string[] },
-  ): Promise<string> {
-    try {
-      this.git.cloneOrFetch(project, slug);
-      this.git.resetToRemoteBranch(project, slug, branch);
-      const repoDir = this.git.getRepoDir(project, slug);
-
-      const { proposals } = await this.audit.analyzeAll(repoDir, carrotConf.packages);
-      const safeFixes = proposals.filter((p) => p.strategy !== 'cannot-fix');
-      let applied = 0;
-
-      // Apply overrides one-by-one (they write to package.json, npm install runs later)
-      for (const proposal of safeFixes) {
-        if (proposal.strategy === 'override') {
-          if (this.audit.applyFix(repoDir, proposal)) applied++;
-        }
-      }
-
-      // Batch upgrades by dir to avoid peer-dep conflicts (e.g. NestJS core+testing)
-      const upgradesByDir = new Map<string, typeof safeFixes>();
-      for (const p of safeFixes) {
-        if (p.strategy === 'upgrade' || p.strategy === 'upgrade-parent') {
-          if (!upgradesByDir.has(p.dir)) upgradesByDir.set(p.dir, []);
-          upgradesByDir.get(p.dir)!.push(p);
-        }
-      }
-      for (const [, dirUpgrades] of upgradesByDir) {
-        if (this.audit.applyUpgrades(repoDir, dirUpgrades)) applied += dirUpgrades.length;
-      }
-      if (applied > 0) {
-        // Cleanup stale overrides after all fixes applied
-        const removedOverrides = this.audit.cleanupStaleOverrides(repoDir, carrotConf.packages);
-        if (removedOverrides.length > 0) {
-          LogSink.info(`Mention audit: removed ${removedOverrides.length} stale override(s)`, TraceTags.AUDIT);
-        }
-        const ts = branchTimestamp();
-        const fixBranch = `audit/mention-${prId}-${ts}`;
-        const commitMsg = `fix(audit): apply ${applied} safe audit fix(es)`;
-        execFileSync('git', ['checkout', '-b', fixBranch], { cwd: repoDir, stdio: 'pipe' });
-        execFileSync('git', ['add', '.'], { cwd: repoDir, stdio: 'pipe' });
-        execFileSync('git', ['commit', '-m', commitMsg], { cwd: repoDir, stdio: 'pipe' });
-        this.git.execGit(['push', 'origin', fixBranch], { cwd: repoDir, stdio: 'pipe', timeout: 120000 });
-
-        const fixPrId = await this.provider.createFixPr(
-          project,
-          slug,
-          commitMsg,
-          `Applied ${applied} safe audit fix(es).`,
-          fixBranch,
-          branch,
-        );
-
-        return `Applied ${applied} audit fix(es) in PR #${fixPrId} (\`${fixBranch}\`).`;
-      }
-      return 'No safe audit fixes could be applied automatically.';
-    } catch (err) {
-      LogSink.error(`audit-fix failed for ${project}/${slug} PR #${prId}: ${err}`, TraceTags.AUDIT);
-      throw err;
-    }
   }
 
   private async checkMentions(

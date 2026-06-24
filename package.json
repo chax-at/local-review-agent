@@ -20,12 +20,9 @@
     "start:production": "npm run start:server",
     "lint": "eslint -c .eslintrc.js --ignore-path .eslintignore \"./src/**\"",
     "ci:stylecheck": "prettier -c src",
-    "audit": "npx --yes @chax-at/better-npm-audit audit -l high -r https://registry.npmjs.org/",
-    "audit:autofix": "node ./tools/audit-autofix.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "reset:all": "ts-node tools/reset-state.ts all",
-    "reset:audit": "ts-node tools/reset-state.ts audit",
     "reset:pr": "ts-node tools/reset-state.ts pr"
   },
   "engines": {

@@ -13,9 +13,6 @@
   "Polling": {
     "IntervalMs": 300000
   },
-  "AuditPoller": {
-    "PollingIntervalMs": 300000
-  },
   "Review": {
     "MaxDiffLines": 5000,
     "MaxFileLines": 1000,
@@ -116,16 +113,5 @@
     }
   },
   "WorkDir": "./repos",
-  "DataDir": "./data",
-  "Summarizer": {
-    "Name": "Summarizer",
-    "ApiKey": "",
-    "ApiBase": "",
-    "Model": "",
-    "AuthHeader": "",
-    "SupportsStructuredOutput": false,
-    "MaxTokenParam": "max_completion_tokens",
-    "InputTokenCostPer1M": 0,
-    "OutputTokenCostPer1M": 0
-  }
+  "DataDir": "./data"
 }

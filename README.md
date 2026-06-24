@@ -1,6 +1,6 @@
 # local-git-reviewer (agent carrot)
 
-Automated PR reviewer and supply-chain security bot for Bitbucket Server / Data Center and Bitbucket Cloud. Reviews code with AI, monitors builds for audit vulnerabilities, and applies fixes. Configured per-repo via `.carrot.jsonc`.
+Automated PR reviewer for Bitbucket Server / Data Center and Bitbucket Cloud. Reviews code with AI and applies fixes on request. Configured per-repo via `.carrot.jsonc`.
 
 
 ``` 
@@ -15,8 +15,6 @@ However, it works really well, so feel free to use and change it on your behalf.
 
 1. **PR code review** — AI reviews every new PR and posts inline comments (severity, file, line)
 2. **Mention commands** — `@carrot` in PR comments to request fixes, reverts, re-reviews, or ask questions
-3. **Audit monitoring** — detects npm audit failures on PR builds, creates fix PRs on the target branch
-4. **Scheduled audits** — proactive audit checks on branches via configurable schedules
 
 ## Prerequisites
 
@@ -24,7 +22,6 @@ However, it works really well, so feel free to use and change it on your behalf.
 - Git
 - Docker (for isolated AI review containers)
 - Bitbucket Server / Data Center instance OR a Bitbucket Cloud workspace
-- Any CI system that reports build status to Bitbucket (e.g. Bamboo, Jenkins)
 
 ## Setup
 
@@ -59,12 +56,6 @@ cp .env.sample .env
 | `REVIEW_MAX_FILE_LINES` | Optional | Files larger than this line count are skipped in review (default: 1000) |
 | `REVIEW_MAX_INFO_TOKENS` | Optional | Token budget for the info-gatherer's added context (DTOs / symbol matches). Roughly 4 chars per token. Set `0` to disable info-gathering. Default: 8000. |
 | `REVIEW_MAX_VALIDATORS` | Optional | Cap on the number of validators that vote per PR. If more validator-enabled models are configured, a random subset of this size is picked per PR and reused across round 1, round 2, suggestion votes, and fix-prompt drafting. Set `0` for no cap. Default: 2. |
-| `SUMMARIZER_API_KEY` | Optional | API key for the Bamboo changelog summarizer (separate from PR review — see below) |
-| `SUMMARIZER_API_BASE` | Optional | Endpoint URL |
-| `SUMMARIZER_MODEL` | Optional | Model name |
-| `SUMMARIZER_NAME` | Optional | Display name |
-| `SUMMARIZER_INPUT_COST` | Optional | Cost per 1M input tokens |
-| `SUMMARIZER_OUTPUT_COST` | Optional | Cost per 1M output tokens |
 
 ### Bitbucket Cloud (alternative to Server)
 
@@ -99,8 +90,6 @@ npm run start:cloud    # talks to BITBUCKET_CLOUD_*
 ```
 
 The default `npm run start` / `npm run start:production` / `npm run start:development` continue to point at the Server entrypoint for back-compat.
-
-Audit monitoring works via Bitbucket's build-status API — no CI system credentials needed.
 
 ## Running
 
@@ -142,8 +131,7 @@ local-git-reviewer-cloud:
 ### Reset state
 
 ```bash
-npm run reset:all          # Clear all state (both pollers start fresh)
-npm run reset:audit        # Clear audit state (re-check builds, re-create audit PRs)
+npm run reset:all          # Clear all PR state (re-review all PRs)
 npm run reset:pr           # Clear all PR state (re-review all PRs)
 npm run reset:pr -- 707    # Clear state for PR #707 only
 ```
@@ -165,7 +153,6 @@ npm run ci:typecheck
 npm run ci:stylecheck
 npm run ci:build
 npm run ci:test
-npm run audit
 ```
 
 ## Testing
@@ -176,30 +163,24 @@ npm run test:watch    # Watch mode
 npm run ci:test       # CI (same as npm test)
 ```
 
-31 test files via Vitest.
+28 test files via Vitest.
 
 ---
 
 ## Architecture
 
-A single polling loop runs on a configurable interval (default: 5 minutes). Each cycle does PR work for all repos first, then audit work for all repos — sequential, so the persistent per-repo clone in `repos/` is never written by two flows at once.
+A single polling loop runs on a configurable interval (default: 5 minutes). Each cycle does PR work for all repos sequentially, so the persistent per-repo clone in `repos/` is never written by two flows at once.
 
 ```
 ┌────────────────────────────────────────────────┐
 │            Poll cycle (single timer)           │
 │                                                │
-│  1. PR phase (PollerService)                   │
+│  PR phase (PollerService)                      │
 │     - Discover repos                           │
 │     - Check PRs                                │
 │     - Detect @mentions                         │
 │     - Run AI review                            │
 │     - Apply fixes / post comments              │
-│                                                │
-│  2. Audit phase (BambooPollerService)          │
-│     - Check build statuses                     │
-│     - Reset persistent clone to target branch  │
-│     - npm install + npm audit                  │
-│     - Create or update audit PR                │
 └────────────────────────────────────────────────┘
                        │
         ┌──────────────▼─────────────┐
@@ -230,11 +211,6 @@ A single polling loop runs on a configurable interval (default: 5 minutes). Each
 | `src/reviewer/llm-client.ts` | OpenAI-compatible API wrapper |
 | `src/reviewer/llm-schemas.ts` | Zod schemas for structured LLM outputs |
 | `src/reviewer/diff.utils.ts` | Diff splitting, filtering, batching |
-| `src/bamboo/bamboo.poller.service.ts` | Build status monitoring, audit fix PRs |
-| `src/bamboo/bamboo.state.service.ts` | Build state persistence (`data/bamboo-state.json`) |
-| `src/audit/audit.service.ts` | npm audit analysis, fix proposal generation |
-| `src/audit/changelog.service.ts` | Package changelog fetching and summarization |
-| `src/audit/npm-registry.client.ts` | npm registry API client |
 | `src/provider/bitbucket-server/server.client.ts` | Bitbucket Server REST API wrapper with retry + timeout |
 | `src/provider/bitbucket-cloud/cloud.client.ts` | Bitbucket Cloud REST API wrapper |
 | `src/config/carrot-config.service.ts` | `.carrot.jsonc` discovery and parsing |
@@ -258,23 +234,8 @@ Commit a `.carrot.jsonc` file to the repo's **default branch**. The bot discover
 
 ```jsonc
 {
-  // Directories containing package.json to audit. Default: ["."]
-  "packages": [".", "frontend", "backend"],
-
   // Enable PR code review. Default: false
   "prReview": true,
-
-  // Enable audit monitoring via build statuses. Default: false
-  "bambooFix": true,
-
-  // How to deliver audit fixes: "direct" (push to the branch), "pr" (always a
-  // separate fix PR), or "protected-only" (PR for protected branches, direct
-  // push otherwise). Default: "protected-only"
-  "fixDelivery": "protected-only",
-
-  // Bamboo plan keys (e.g. "PROJ-PLAN") to poll for this repo. Optional — if any
-  // bamboo-enabled repo lists keys, only those plans are scanned. Default: all plans
-  "bambooPlanKeys": ["PROJ-PLAN"],
 
   // Post validator-approved code suggestions on inline review comments. Default: true
   "suggestCodeFixes": true,
@@ -284,33 +245,13 @@ Commit a `.carrot.jsonc` file to the repo's **default branch**. The bot discover
   // Examples: "node:22-slim", "node:24-slim"
   "dockerImage": "node:24-slim",
 
-  // Branches considered protected (glob patterns). Default: ["main", "master", "release/*"]
-  "protectedBranches": ["main", "master", "release/*"],
-
   // Files to read for code standards/rules (from target branch).
   // Default: ["CLAUDE.md", "AGENTS.md"] (+ lowercase variants)
   "rulesFiles": ["CLAUDE.md", "AGENTS.md", "CODING_STANDARDS.md"],
 
   // Include LLM-generated fix prompts in review summaries and rejection comments.
   // Costs extra tokens per review. Default: false
-  "generateFixPrompts": true,
-
-  // Scheduled audit checks — run audits on branches even without a failed build.
-  // Triggers when the last check is older than staleAfterDays and the configured time is reached.
-  "auditSchedules": [
-    {
-      "branch": "master",        // Branch to audit
-      "staleAfterDays": 7,       // Only run if last check is older than 7 days
-      "hour": 6,                 // Run at 06:30
-      "minute": 30
-    },
-    {
-      "branch": "release",
-      "staleAfterDays": 3,
-      "hour": 7,
-      "minute": 0
-    }
-  ]
+  "generateFixPrompts": true
 }
 ```
 
@@ -321,35 +262,17 @@ Commit a `.carrot.jsonc` file to the repo's **default branch**. The bot discover
 Generate a `.carrot.jsonc` config file for my repository.
 
 First, look at my repo structure to understand it:
-- Find all directories containing a package.json (these are the `packages` to audit)
-- Check which branches exist (main, master, release, develop, etc.)
 - Look for existing code standards files (CLAUDE.md, AGENTS.md, CODING_STANDARDS.md, etc.)
 - Check the Node.js version in package.json engines or .nvmrc (to pick the right `dockerImage`)
-
-Then ask me which features I want:
-- PR code review (prReview)
-- Audit monitoring on failed builds (bambooFix)
-- Scheduled audit checks on specific branches (auditSchedules)
 
 Here is the full schema with defaults:
 
 interface ICarrotConfig {
-  packages: string[];              // Dirs with package.json. Default: ["."]
   prReview: boolean;               // AI code review on new PRs. Default: false
-  bambooFix: boolean;              // Audit fix on failed builds. Default: false
-  fixDelivery: 'direct' | 'pr' | 'protected-only'; // Fix delivery mode. Default: "protected-only"
-  protectedBranches: string[];     // Glob patterns. Default: ["main", "master", "release/*"]
   dockerImage?: string;            // For AI review containers. Default: node:lts-slim
-  bambooPlanKeys?: string[];       // Bamboo plan keys to poll. Default: all plans
   rulesFiles?: string[];           // Code standards files from target branch. Default: ["CLAUDE.md", "AGENTS.md"]
   generateFixPrompts?: boolean;    // LLM fix prompts in summaries. Default: false
   suggestCodeFixes?: boolean;      // Inline code suggestions on review comments. Default: true
-  auditSchedules?: Array<{
-    branch: string;                // Branch to audit
-    staleAfterDays: number;        // Only run if last check is older than N days
-    hour: number;                  // Hour of day (0-23, server-local timezone)
-    minute: number;                // Minute (0-59)
-  }>;
 }
 
 Output valid JSONC. Only include fields I need — omit anything that matches the defaults.
@@ -387,7 +310,7 @@ See [End-to-end review workflow](#end-to-end-review-workflow) for the full stage
 **Decision gates:**
 - `.carrot.jsonc` must exist with `prReview: true`
 - PR must not be a draft
-- PR branch must not start with `audit/` or `carrot/` (bot-created)
+- PR branch must not start with `carrot/` (bot-created)
 - PR must not have been successfully reviewed before (and fewer than 3 failed auto-review attempts)
 
 ### Flow 2: Mention commands (`@carrot`)
@@ -402,7 +325,6 @@ Tag `@carrot` in any PR comment. The bot understands natural language — no key
 | Fix all review findings | "@carrot autofix everything" |
 | Revert a change | "@carrot revert the last commit" |
 | Re-run review | "@carrot review this again" |
-| Fix audit vulnerabilities | "@carrot run the audit fix" |
 | Ask a question | "@carrot why did you flag line 42?" |
 | Have a conversation | "@carrot I disagree, this is intentional" |
 
@@ -427,38 +349,11 @@ User: @carrot fix the null check on line 42
 |---------|---------------|------------|
 | fix | `carrot/fix-{prId}-{timestamp}` | Source branch of the original PR |
 | autofix | `carrot/autofix-{prId}-{timestamp}` | Source branch |
-| audit-fix | `audit/mention-{prId}-{timestamp}` | Source branch |
 | revert | `carrot/revert-{prId}-{timestamp}` | Source branch |
 
 All fix PRs have `deleteSourceBranchOnMerge` enabled.
 
-### Flow 3: Audit monitoring (build failure → fix PR on target branch)
-
-**Trigger:** Any failed build on an open PR (detected via Bitbucket's build-status API). Requires `bambooFix: true` in `.carrot.jsonc`.
-
-Audit issues on the target branch affect ALL PRs targeting it. The bot fixes the target branch once so all PRs pass.
-
-```
-Audit Poller cycle
-└─ For each repo with bambooFix:
-   └─ For each open PR (not draft, not bot-branch):
-      └─ GET build statuses for the latest commit (Server: /rest/build-status/1.0/commits/<hash>; Cloud: /2.0/repositories/<ws>/<repo>/commit/<hash>/statuses)
-         └─ For each FAILED build (not yet in bamboo-state.json):
-            ├─ Clone TARGET branch (not PR branch)
-            ├─ npm install + npm audit --json in Docker
-            ├─ Collect high/critical vulnerabilities
-            ├─ Generate fix proposals (override or upgrade)
-            ├─ Apply all safe fixes
-            ├─ Re-verify each dir; exclude dirs that still fail
-            ├─ Create or update audit PR (passing dirs only):
-            │   ├─ Existing open audit PR for this target branch? → force-push updates
-            │   └─ No → create audit/YYYY.MM.DD-HH.mm branch + PR
-            └─ Comment on original PR linking to audit fix PR
-```
-
-One audit PR per (repo, target branch) at a time. New vulnerabilities update the existing PR.
-
-### Flow 4: Autofix with lint
+### Flow 3: Autofix with lint
 
 **Trigger:** `@carrot autofix` mention on a PR.
 
@@ -646,22 +541,16 @@ Est. cost: ~0.0234 EUR
 
 Pi-runner costs are attributed to the review model that ran them, costed with that model's `INPUT_COST`/`OUTPUT_COST` rates.
 
-### Summarizer (Bamboo changelog — not PR review)
-
-The `SUMMARIZER_*` variables configure a separate model used exclusively for generating changelog summaries in audit fix PRs (the Bamboo flow). This model is not involved in PR review or validation.
-
 ---
 
 ## Loop prevention
 
-The bot must never trigger itself. Six mechanisms ensure that:
+The bot must never trigger itself. These mechanisms ensure that:
 
-1. **Bot branch filtering** — Both pollers skip PRs whose source branch starts with `audit/` or `carrot/`. All bot-created branches use these prefixes.
+1. **Bot branch filtering** — The poller skips PRs whose source branch starts with `carrot/`. All bot-created branches use this prefix.
 2. **Author-based comment detection** — The bot has a dedicated Bitbucket user (`carrot`). The mention scanner skips comments authored by the bot and checks for bot-authored child replies before processing.
 3. **State-first dedup** — `processedMentionIds` in `data/state.json` is checked before any API call. `getComment()` confirms via bot-authored child reply. `lastActivityId` watermark gates top-level activity.
-4. **Build key tracking** — Each build result key is stored in `data/bamboo-state.json` after first check.
-5. **One review per PR** — Auto-review only runs on first encounter. Subsequent reviews require explicit `@carrot` mention.
-6. **Audit PR idempotency** — One audit PR per (repo, target branch). Tracked in `auditPrs` state map.
+4. **One review per PR** — Auto-review only runs on first encounter. Subsequent reviews require explicit `@carrot` mention.
 
 ---
 
@@ -688,33 +577,8 @@ The bot must never trigger itself. Six mechanisms ensure that:
 
 On Bitbucket Cloud deployments, the `PROJECT/slug` repo key becomes `workspace/slug` (e.g. `my-workspace/example-repo`). State files are not portable between providers — use a fresh `data/` directory when switching.
 
-### `data/bamboo-state.json` — Build + audit PR state
-
-```javascript
-{
-  builds: {
-    "PROJ-PLAN-7": {
-      checkedAt: "2026-03-23T...",
-      state: "Failed",
-      auditIssue: true,
-      status: "fix_applied",
-      vulnerabilities: [...]
-    }
-  },
-  auditPrs: {
-    "PROJ/example-repo:master": {
-      auditBranch: "audit/2026.03.23-14.30",
-      prId: 456,
-      targetBranch: "master",
-      lastUpdated: "2026-03-23T..."
-    }
-  }
-}
-```
-
 ### Other data directories
 
-- `data/audit-verify-failures/` — npm audit output when fixes still fail (last 20 kept)
 - `data/pi-dumps/` — last 10 AI outputs for debugging (timestamped JSONL)
 - `data/heartbeat` — written each poll cycle, used by Docker HEALTHCHECK
 - `/tmp/carrot/` — temp workspaces, wiped at start of each PR poll cycle
@@ -740,7 +604,6 @@ The Docker image is configurable per-repo via `dockerImage` in `.carrot.jsonc`.
 - Docker containers run as the host user (`--user uid:gid`), never as root
 - Bot has a dedicated Bitbucket user — comments identified by author, not prefix
 - API keys are redacted in debug logs
-- AI review is excluded from audit fixes to prevent prompt injection from malicious packages
 
 ## Debug logs
 

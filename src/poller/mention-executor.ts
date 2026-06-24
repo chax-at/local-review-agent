@@ -14,7 +14,6 @@ export interface IMentionToolResult {
 interface IExecutorDeps {
   reviewer: ReviewerService;
   handleRevert: (message: string) => Promise<string>;
-  handleAuditFix: () => Promise<string>;
   postReply: (text: string) => Promise<void>;
   pr: {
     project: string;
@@ -75,8 +74,6 @@ export async function executeMentionTool(
         pr.sourceCommit,
       );
       return { success: true, message: 'Review posted.' };
-    case 'audit_fix':
-      return { success: true, message: await deps.handleAuditFix() };
     case 'explain':
     case 'reply':
       await deps.postReply(route.message);

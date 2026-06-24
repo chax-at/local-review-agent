@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 /** Branch prefixes created by the bot. Used to filter out bot PRs from processing. */
-export const BOT_BRANCH_PREFIXES = ['audit/', 'carrot/'];
+export const BOT_BRANCH_PREFIXES = ['carrot/'];
 
 /** Base temp directory for all bot temp files. Cleaned at the start of each poll cycle. */
 export const BOT_TEMP_DIR = path.join(os.tmpdir(), 'carrot');

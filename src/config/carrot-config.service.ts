@@ -102,7 +102,7 @@ export class CarrotConfigService {
     this.provider = provider;
   }
 
-  /** Clears resolved-config cache (call each poll cycle; shared with Bamboo). */
+  /** Clears resolved-config cache (call each poll cycle). */
   public clearCache(): void {
     this.cache.clear();
   }
