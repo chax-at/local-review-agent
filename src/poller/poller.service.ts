@@ -153,10 +153,10 @@ export class PollerService {
     // ── Cycle summary ──
     const carrotGaps = this.carrotConfig.getCycleCarrotGaps();
     if (carrotGaps.missingFile.length > 0) {
-      LogSink.debug(`No .carrot.jsonc for: ${carrotGaps.missingFile.join(', ')}`, TraceTags.POLLER);
+      LogSink.debug(`No .chaxy.jsonc/.carrot.jsonc for: ${carrotGaps.missingFile.join(', ')}`, TraceTags.POLLER);
     }
     if (carrotGaps.invalidFile.length > 0) {
-      LogSink.warn(`Invalid .carrot.jsonc for: ${carrotGaps.invalidFile.join(', ')}`, TraceTags.POLLER);
+      LogSink.warn(`Invalid .chaxy.jsonc/.carrot.jsonc for: ${carrotGaps.invalidFile.join(', ')}`, TraceTags.POLLER);
     }
 
     this.state.save();
@@ -168,7 +168,7 @@ export class PollerService {
 
     if (prs.length === 0) return;
 
-    // Only fetch .carrot.jsonc if repo has open PRs
+    // Only fetch the chaxy config if repo has open PRs
     const carrotConf = await this.carrotConfig.getConfig(project, slug);
     if (!carrotConf) {
       return;

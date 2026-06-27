@@ -1,5 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { stripJsoncComments, parseCarrotConfig } from '../../src/config/carrot-config.service';
+import {
+  stripJsoncComments,
+  parseCarrotConfig,
+  CarrotConfigService,
+} from '../../src/config/carrot-config.service';
+
+function makeReader(files: Record<string, string | null>) {
+  const requested: string[] = [];
+  return {
+    requested,
+    getFileContent: async (_project: string, _slug: string, filePath: string) => {
+      requested.push(filePath);
+      return files[filePath] ?? null;
+    },
+  };
+}
 
 describe('stripJsoncComments', () => {
   it('strips single-line comments', () => {
@@ -40,5 +55,36 @@ describe('parseCarrotConfig', () => {
     const config = parseCarrotConfig(input);
     expect(config).not.toBeNull();
     expect(config!.prReview).toBe(true);
+  });
+});
+
+describe('CarrotConfigService', () => {
+  it('reads config from .chaxy.jsonc', async () => {
+    const reader = makeReader({ '.chaxy.jsonc': '{ "prReview": true }' });
+    const service = new CarrotConfigService(reader);
+
+    const config = await service.getConfig('PROJ', 'repo');
+
+    expect(config?.prReview).toBe(true);
+  });
+
+  it('falls back to .carrot.jsonc when .chaxy.jsonc is absent', async () => {
+    const reader = makeReader({ '.carrot.jsonc': '{ "prReview": true }' });
+    const service = new CarrotConfigService(reader);
+
+    const config = await service.getConfig('PROJ', 'repo');
+
+    expect(config?.prReview).toBe(true);
+    expect(reader.requested).toContain('.chaxy.jsonc');
+  });
+
+  it('returns null and records the repo as missing when neither file exists', async () => {
+    const reader = makeReader({});
+    const service = new CarrotConfigService(reader);
+
+    const config = await service.getConfig('PROJ', 'repo');
+
+    expect(config).toBeNull();
+    expect(service.getCycleCarrotGaps().missingFile).toContain('PROJ/repo');
   });
 });

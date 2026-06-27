@@ -9,6 +9,9 @@ interface IFileContentReader {
   ): Promise<string | null>;
 }
 
+/** Config file names tried in order. `.chaxy.jsonc` is preferred; `.carrot.jsonc` is kept for back-compat. */
+const CONFIG_FILE_NAMES = ['.chaxy.jsonc', '.carrot.jsonc'];
+
 export function stripJsoncComments(text: string): string {
   let result = '';
   let i = 0;
@@ -93,7 +96,7 @@ export function parseCarrotConfig(raw: string): ICarrotConfig | null {
 export class CarrotConfigService {
   private readonly provider: IFileContentReader;
   private readonly cache = new Map<string, ICarrotConfig | null>();
-  /** Repos where `.carrot.jsonc` is missing (404), accumulated for one poll cycle summary. */
+  /** Repos where no config file (`.chaxy.jsonc`/`.carrot.jsonc`) was found (404), accumulated for one poll cycle summary. */
   private readonly cycleMissingFile = new Set<string>();
   /** Repos where the file exists but JSON/config is invalid, accumulated for one poll cycle summary. */
   private readonly cycleInvalidFile = new Set<string>();
@@ -113,7 +116,7 @@ export class CarrotConfigService {
     this.cycleInvalidFile.clear();
   }
 
-  /** Snapshot of repos with missing or invalid `.carrot.jsonc` for the current PR poll cycle. */
+  /** Snapshot of repos with a missing or invalid config file for the current PR poll cycle. */
   public getCycleCarrotGaps(): { missingFile: string[]; invalidFile: string[] } {
     return {
       missingFile: [...this.cycleMissingFile].sort(),
@@ -133,7 +136,7 @@ export class CarrotConfigService {
       return this.cache.get(cacheKey) ?? null;
     }
 
-    const raw = await this.provider.getFileContent(project, slug, '.carrot.jsonc', { quiet: true });
+    const raw = await this.fetchRawConfig(project, slug);
 
     if (raw === null) {
       if (recordCycleGaps) this.cycleMissingFile.add(cacheKey);
@@ -149,5 +152,14 @@ export class CarrotConfigService {
 
     this.cache.set(cacheKey, config);
     return config;
+  }
+
+  /** Returns the first config file found among {@link CONFIG_FILE_NAMES}, or null if none exist. */
+  private async fetchRawConfig(project: string, slug: string): Promise<string | null> {
+    for (const fileName of CONFIG_FILE_NAMES) {
+      const raw = await this.provider.getFileContent(project, slug, fileName, { quiet: true });
+      if (raw !== null) return raw;
+    }
+    return null;
   }
 }
