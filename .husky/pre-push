@@ -1,0 +1,3 @@
+npm run lint
+npm run ci:audit
+npm run ci:test
