@@ -165,6 +165,35 @@ npm run ci:test       # CI (same as npm test)
 
 28 test files via Vitest.
 
+## Pushing changes / remotes
+
+This repo is pushed to two GitHub remotes:
+
+| Remote | URL | Purpose |
+|--------|-----|---------|
+| `origin` | `github.com/Nkay/local-git-reviewer` | working remote (upstream of `public-main`) |
+| `public` | `github.com/chax-at/local-review-agent` | chax-at published mirror |
+
+Work happens on the local `public-main` branch. To publish it to the chax-at repo's `main`:
+
+```bash
+git push public public-main:main
+```
+
+To push to the working `origin` remote:
+
+```bash
+git push origin public-main
+```
+
+### Pre-push hook (Windows / WSL note)
+
+A husky `pre-push` hook runs `lint`, `ci:audit`, and `ci:test` before every push, so
+**run `git push` from a shell where Node.js is on `PATH` — inside WSL/Linux, not a Windows Git client.**
+Pushing from a Windows tool against a `\\wsl.localhost\...` path fails with
+`'eslint' is not recognized` because `cmd.exe` cannot use UNC paths. To skip the
+hook for a one-off push, add `--no-verify`.
+
 ---
 
 ## Architecture
