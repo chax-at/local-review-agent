@@ -10,6 +10,7 @@
     "ci:build": "npm ci --include=dev && npm run build && npm prune --production",
     "ci:lint": "npm ci --include=dev && npm run lint",
     "ci:typecheck": "tsc --noEmit",
+    "ci:audit": "npx --yes @chax-at/better-npm-audit@3.6.6 audit -l high -r https://registry.npmjs.org/",
     "ci:test": "vitest run",
     "start": "node dist/src/main-server.js",
     "start:server": "node dist/src/main-server.js",
@@ -23,7 +24,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "reset:all": "ts-node tools/reset-state.ts all",
-    "reset:pr": "ts-node tools/reset-state.ts pr"
+    "reset:pr": "ts-node tools/reset-state.ts pr",
+    "prepare": "husky"
   },
   "engines": {
     "node": ">=24"
@@ -41,15 +43,16 @@
     "@types/config": "^3.3.0",
     "@types/node": "^20.0.0",
     "@typescript-eslint/eslint-plugin": "^6.2.1",
-    "concurrently": "^8.2.0",
+    "concurrently": "^10.0.3",
     "eslint-config-airbnb-base": "^15.0.0",
     "eslint-config-prettier": "^10.1.8",
+    "husky": "^9.1.7",
     "nodemon": "^3.0.1",
     "prettier": "^3.8.1",
     "ts-node": "^10.9.0",
     "tsconfig-paths": "^4.2.0",
     "typescript": "^5.9.3",
-    "vitest": "^1.0.0",
-    "wait-on": "^7.0.1"
+    "vitest": "^4.1.10",
+    "wait-on": "^9.0.10"
   }
 }
