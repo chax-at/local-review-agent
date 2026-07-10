@@ -1,4 +1,5 @@
 {
+  "DataDir": "DATA_DIR",
   "Bitbucket": {
     "BaseUrl": "BITBUCKET_BASE_URL",
     "BotUsername": "BITBUCKET_BOT_USERNAME",

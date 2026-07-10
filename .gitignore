@@ -4,6 +4,7 @@ dist/
 config/local-development.json
 repos/
 data/
+data-*/
 *.log
 .idea/
 .worktrees/

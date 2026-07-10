@@ -107,7 +107,9 @@ export class GitService {
       LogSink.debug(`Clone target: ${repoDir}`, TraceTags.GIT);
       this.execGit(['clone', cloneUrl, repoDir], {
         stdio: 'pipe',
-        timeout: 120000,
+        // First-ever clone of a cold repo can stall for minutes while the
+        // remote generates the pack, so this is deliberately generous.
+        timeout: 240000,
       });
       this.fetchedRepos.add(repoKey);
     } else {

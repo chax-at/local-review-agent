@@ -82,11 +82,16 @@ The Cloud bot polls every repository in the workspace. Discovery is automatic â€
 
 ### Running both providers side-by-side
 
-Use the dedicated scripts in two separate processes:
+Use the dedicated scripts in two separate processes, and give each instance its
+own state directory via `DATA_DIR` (default: `./data`). Both instances hold the
+whole state file in memory and rewrite it on every save, so sharing one
+`data/state.json` silently clobbers the other instance's review markers, retry
+counters, and mention watermarks. Pass `DATA_DIR` per process â€” setting it in
+the shared `.env` would give both instances the same value again:
 
 ```bash
-npm run start:server   # talks to BITBUCKET_*
-npm run start:cloud    # talks to BITBUCKET_CLOUD_*
+npm run start:server                        # talks to BITBUCKET_*, uses ./data
+DATA_DIR=./data-cloud npm run start:cloud   # talks to BITBUCKET_CLOUD_*, uses ./data-cloud
 ```
 
 The default `npm run start` / `npm run start:production` / `npm run start:development` continue to point at the Server entrypoint for back-compat.
