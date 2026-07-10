@@ -56,6 +56,28 @@ describe('parseCarrotConfig', () => {
     expect(config).not.toBeNull();
     expect(config!.prReview).toBe(true);
   });
+
+  it('tolerates trailing commas in arrays and objects', () => {
+    const input = `{
+      // Directories with a package.json to audit
+      "packages": [
+        ".",
+        "packages/schag-ufe/src-capacitor",
+      ],
+      "prReview": true,
+      "auditSchedules": [],
+    }`;
+    const config = parseCarrotConfig(input);
+    expect(config).not.toBeNull();
+    expect(config!.prReview).toBe(true);
+  });
+
+  it('does not treat commas inside strings as trailing commas', () => {
+    const input = '{ "prReview": true, "rulesFiles": ["a,]", "b,}"] }';
+    const config = parseCarrotConfig(input);
+    expect(config).not.toBeNull();
+    expect(config!.rulesFiles).toEqual(['a,]', 'b,}']);
+  });
 });
 
 describe('CarrotConfigService', () => {

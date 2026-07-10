@@ -77,9 +77,63 @@ export function stripJsoncComments(text: string): string {
   return result;
 }
 
+/** Removes trailing commas (before `}` or `]`) so JSONC files pass strict JSON.parse. Expects comments to be stripped already. */
+export function stripTrailingCommas(text: string): string {
+  let result = '';
+  let i = 0;
+  let inString = false;
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    if (inString) {
+      if (ch === '\\') {
+        // Escape sequence: consume both characters verbatim
+        result += ch;
+        i++;
+        if (i < text.length) {
+          result += text[i];
+          i++;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      result += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      result += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === ',') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) {
+        j++;
+      }
+      if (text[j] === '}' || text[j] === ']') {
+        // Trailing comma: drop it, keep the whitespace that follows
+        i++;
+        continue;
+      }
+    }
+
+    result += ch;
+    i++;
+  }
+
+  return result;
+}
+
 export function parseCarrotConfig(raw: string): ICarrotConfig | null {
   try {
-    const stripped = stripJsoncComments(raw);
+    const stripped = stripTrailingCommas(stripJsoncComments(raw));
     const parsed = JSON.parse(stripped) as Partial<ICarrotConfig>;
 
     const config: ICarrotConfig = {
