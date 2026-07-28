@@ -615,7 +615,7 @@ On Bitbucket Cloud deployments, the `PROJECT/slug` repo key becomes `workspace/s
 
 - `data/pi-dumps/` — last 10 AI outputs for debugging (timestamped JSONL)
 - `data/heartbeat` — written each poll cycle, used by Docker HEALTHCHECK
-- `/tmp/carrot/` — temp workspaces, wiped at start of each PR poll cycle
+- `/tmp/carrot/<pid>/` — temp workspaces for one bot process, wiped at the start of each of its PR poll cycles. The dir is per-process on purpose: several instances (e.g. `start:server` and `start:cloud`) share `/tmp/carrot`, and wiping the whole root would delete the Docker workspace of a review another instance is running. Dirs of instances that are no longer running are reclaimed once they are older than 10 minutes.
 
 ---
 

@@ -11,7 +11,15 @@ import { CarrotConfigService } from '../config/carrot-config.service';
 import { GitService } from '../reviewer/git.service';
 import type { IMentionCommand } from '../types';
 import { REPO_ACTIVITY_WINDOW_MS, repoHasRecentActivity } from './repo-activity';
-import { BOT_BRANCH_PREFIXES, BOT_TEMP_DIR, branchTimestamp, isBotComment, isBotMention } from '../constants';
+import {
+  BOT_BRANCH_PREFIXES,
+  BOT_TEMP_DIR,
+  BOT_TEMP_ROOT,
+  branchTimestamp,
+  isBotComment,
+  isBotMention,
+} from '../constants';
+import { pidIsAlive, pruneTempRoot, TEMP_DIR_STALE_AFTER_MS } from '../temp-dir';
 import { MentionRouter } from './mention-router';
 import { executeMentionTool } from './mention-executor';
 import { buildMentionContext, sliceCodeAroundLine, type IMentionContext } from './mention-context';
@@ -599,13 +607,25 @@ export class PollerService {
     }
   }
 
-  /** Wipe the shared temp dir to free disk space from previous cycles. */
+  /**
+   * Reset this instance's temp dir to free disk space from previous cycles, and
+   * reclaim dirs left behind by instances that are no longer running.
+   *
+   * Only this process's `<root>/<pid>` subtree is wiped: the temp root is shared
+   * machine-wide, and wiping it whole deletes the Docker workspace of a review
+   * another instance is running right then — the container then exits 0 with its
+   * output file unlinked, which surfaces as "pi produced no output file".
+   */
   private cleanupTempDir(): void {
     try {
-      if (fs.existsSync(BOT_TEMP_DIR)) {
-        fs.rmSync(BOT_TEMP_DIR, { recursive: true, force: true });
+      const removed = pruneTempRoot(BOT_TEMP_ROOT, BOT_TEMP_DIR, {
+        isAlive: pidIsAlive,
+        now: Date.now(),
+        staleAfterMs: TEMP_DIR_STALE_AFTER_MS,
+      });
+      if (removed.length > 0) {
+        LogSink.info(`Reclaimed ${removed.length} abandoned temp dir(s) in ${BOT_TEMP_ROOT}`, TraceTags.POLLER);
       }
-      fs.mkdirSync(BOT_TEMP_DIR, { recursive: true });
     } catch (err) {
       LogSink.warn(`Failed to clean temp dir ${BOT_TEMP_DIR}: ${err}`, TraceTags.POLLER);
     }

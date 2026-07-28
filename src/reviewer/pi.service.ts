@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import LogSink from '@chax-at/log-sink';
@@ -25,6 +25,84 @@ const SEVERITY_MAP: Record<string, IReviewFinding['severity']> = {
 
 function normalizeSeverity(severity: string): IReviewFinding['severity'] {
   return SEVERITY_MAP[severity.toLowerCase()] ?? 'note';
+}
+
+/**
+ * Largest pi log read into a string. V8 caps strings at ~512 MB, so a whole-file
+ * read of a very long model trace throws ERR_STRING_TOO_LONG and loses the run.
+ * Above this cap only the tail is parsed — findings live in the trailing
+ * message_end events, so a truncated tail still beats a failed review.
+ */
+export const MAX_PI_OUTPUT_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Create a run directory under this instance's temp dir. The temp dir is
+ * per-process and recreated each poll cycle, so make sure it exists rather than
+ * relying on the cycle having run first.
+ */
+function makeRunDir(prefix: string): string {
+  fs.mkdirSync(BOT_TEMP_DIR, { recursive: true });
+  return fs.mkdtempSync(path.join(BOT_TEMP_DIR, prefix));
+}
+
+/**
+ * Read the container's log file, falling back to its last {@link MAX_PI_OUTPUT_BYTES}
+ * bytes when the file is too big to hold in a single string. Read errors
+ * (including ENOENT) propagate so callers can retry.
+ */
+export function readPiOutput(file: string, maxBytes: number = MAX_PI_OUTPUT_BYTES): string {
+  const size = fs.statSync(file).size;
+  if (size <= maxBytes) return fs.readFileSync(file, 'utf-8');
+
+  LogSink.warn(`pi output is ${size} bytes; parsing only the last ${maxBytes} bytes`, TraceTags.PI);
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    fs.readSync(fd, buf, 0, maxBytes, size - maxBytes);
+    const text = buf.toString('utf-8');
+    // Drop the leading partial line — every parser downstream splits on newlines.
+    const firstNewline = text.indexOf('\n');
+    return firstNewline === -1 ? text : text.slice(firstNewline + 1);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Explain why the container's log could not be read. The read failing is not
+ * proof that pi wrote nothing: the workspace may have been deleted mid-run, or
+ * the file may be present but too large to load.
+ */
+export function describeOutputReadFailure(
+  err: NodeJS.ErrnoException | null,
+  workspaceHost: string,
+  outHost: string,
+): string {
+  const code = err?.code ?? 'unknown';
+  const message = err?.message ?? 'no error captured';
+
+  if (!fs.existsSync(workspaceHost)) {
+    return `workspace directory ${workspaceHost} no longer exists — it was removed while the container was running (${code}); the container wrote to an unlinked file`;
+  }
+
+  let size: number | null = null;
+  try {
+    size = fs.statSync(outHost).size;
+  } catch {
+    size = null;
+  }
+
+  if (size === null) {
+    let siblings = '(unreadable)';
+    try {
+      siblings = fs.readdirSync(workspaceHost).join(', ') || '(empty)';
+    } catch {
+      /* keep placeholder */
+    }
+    return `${outHost} was never created (${code}); workspace still holds: ${siblings}`;
+  }
+
+  return `${outHost} exists (${size} bytes) but could not be read: ${code}: ${message}`;
 }
 
 export function parsePiFindings(output: string): IReviewFinding[] {
@@ -347,7 +425,7 @@ export class PiService {
     dockerImageOverride?: string,
     personaDirective: string = PERSONA_DIRECTIVES.generic,
   ): IPiReviewResult {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-'));
+    const tmpDir = makeRunDir('pi-');
     try {
       for (let i = 0; i < diffs.length; i++) {
         fs.writeFileSync(path.join(tmpDir, `chunk-${i}.patch`), diffs[i]);
@@ -414,7 +492,7 @@ export class PiService {
     lintScript: string,
     dockerImageOverride?: string,
   ): { failed: boolean; output: string } {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-lint-'));
+    const tmpDir = makeRunDir('pi-lint-');
     try {
       const cmd = buildLintScript(lintScript);
       // No `set -e`: the script's exit code is npm's exit code. Stderr is
@@ -441,7 +519,7 @@ export class PiService {
       let output = '';
       if (failed) {
         try {
-          output = fs.readFileSync(path.join(tmpDir, 'lgr-pi-out.log'), 'utf-8').slice(0, 5000);
+          output = readPiOutput(path.join(tmpDir, 'lgr-pi-out.log')).slice(0, 5000);
         } catch {
           output = '(lint output unavailable)';
         }
@@ -459,7 +537,7 @@ export class PiService {
     userMessage: string,
     dockerImageOverride?: string,
   ): { summary: string | null; usage: IPiTokenUsage } {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-fix-'));
+    const tmpDir = makeRunDir('pi-fix-');
     try {
       fs.writeFileSync(path.join(tmpDir, 'diff.patch'), diffContent);
 
@@ -586,27 +664,32 @@ export class PiService {
 
     const timeout = opts.timeout ?? this.timeoutMs + DOCKER_INSTALL_BUFFER_MS;
 
-    // Capture docker's own stdout/stderr + exit so a failure isn't reduced to a
-    // bare ENOENT below. With the in-container redirect, docker's stdout is
-    // normally empty; daemon-level errors (image pull, mount failure, non-zero
-    // exit, timeout kill) land on stderr/the thrown error.
-    let dockerStdout = '';
-    let dockerStderr = '';
-    try {
-      dockerStdout = execFileSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' }) ?? '';
-    } catch (err: any) {
-      dockerStdout = typeof err?.stdout === 'string' ? err.stdout : '';
-      dockerStderr = typeof err?.stderr === 'string' ? err.stderr : '';
+    // spawnSync (not execFileSync) so docker's stderr is captured on success too:
+    // it is the only place daemon-level warnings show up, and the previous error
+    // log printed "(empty)" for it whether or not anything had been written.
+    // With the in-container redirect, docker's stdout is normally empty.
+    const spawned = spawnSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' });
+    const dockerStdout = spawned.stdout ?? '';
+    const dockerStderr = spawned.stderr ?? '';
+    if (spawned.error || spawned.status !== 0) {
+      const killed = Boolean(spawned.error) && spawned.signal !== null;
       appendDockerErrorLog({
         context: `docker run failed (model=${this.model}, provider=${this.provider}, image=${image})`,
         command: `docker ${logArgs.join(' ')}`,
-        exitStatus: typeof err?.status === 'number' ? err.status : null,
-        signal: err?.signal ?? null,
+        exitStatus: spawned.status,
+        signal: spawned.signal,
         stdout: dockerStdout,
         stderr: dockerStderr,
-        detail: err?.killed ? `process killed (timeout ${timeout}ms or signal)` : String(err?.message ?? err),
+        detail: killed
+          ? `process killed (timeout ${timeout}ms or signal)`
+          : String(spawned.error?.message ?? `docker exited with status ${spawned.status}`),
       });
-      throw err;
+      throw (
+        spawned.error ??
+        new Error(
+          `docker run exited with status ${spawned.status}: ${dockerStderr.trim().slice(0, 300) || '(no stderr)'}`,
+        )
+      );
     }
 
     // The container writes the redirect file onto a bind mount; under some Docker
@@ -614,26 +697,31 @@ export class PiService {
     // Retry the read briefly before treating a missing file as a real failure.
     const READ_ATTEMPTS = 4;
     let output: string | null = null;
+    let readErr: NodeJS.ErrnoException | null = null;
     for (let attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
       try {
-        output = fs.readFileSync(outHost, 'utf-8');
+        output = readPiOutput(outHost);
         break;
-      } catch {
+      } catch (err) {
+        readErr = err as NodeJS.ErrnoException;
         sleepSync(250);
       }
     }
 
     if (output === null) {
+      // Never claim the file was "not produced" — the read can also fail because
+      // the workspace was deleted mid-run or the log outgrew V8's string cap.
+      const cause = describeOutputReadFailure(readErr, workspaceHost, outHost);
       appendDockerErrorLog({
-        context: `docker exited cleanly but ${outLogName} was never produced (model=${this.model}, provider=${this.provider}, image=${image})`,
+        context: `docker exited cleanly but ${outLogName} could not be read (model=${this.model}, provider=${this.provider}, image=${image})`,
         command: `docker ${logArgs.join(' ')}`,
-        exitStatus: 0,
-        signal: null,
+        exitStatus: spawned.status,
+        signal: spawned.signal,
         stdout: dockerStdout,
         stderr: dockerStderr,
-        detail: `output file still missing on host after ${READ_ATTEMPTS} read attempts: ${outHost}`,
+        detail: `after ${READ_ATTEMPTS} read attempts: ${cause}`,
       });
-      throw new Error(`pi produced no output file (${outLogName}) despite a clean docker exit; see data/error.log`);
+      throw new Error(`pi output unreadable after a clean docker exit: ${cause}; see data/error.log`);
     }
 
     // Dump last pi output to data/ for debugging (best-effort)
