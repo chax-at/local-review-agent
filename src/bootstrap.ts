@@ -13,6 +13,7 @@ import { ensurePiRunnerImage } from './reviewer/pi-runner-image';
 import { LlmClient, type ILlmConfig } from './reviewer/llm-client';
 import { MultiModelValidator } from './reviewer/multi-model-validator';
 import { InfoGatherer } from './reviewer/info-gatherer';
+import { createHeartbeat } from './heartbeat';
 import { FindingDeduplicator } from './reviewer/finding-deduplicator';
 import { CarrotConfigService } from './config/carrot-config.service';
 import { MentionRouter } from './poller/mention-router';
@@ -152,6 +153,8 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
 
   const carrotConfigService = new CarrotConfigService(provider);
 
+  const heartbeat = createHeartbeat(path.join(dataDir, 'heartbeat'));
+
   const reviewerService = new ReviewerService(
     provider,
     gitService,
@@ -164,9 +167,9 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     infoGatherer,
     deduplicator,
     maxValidators,
+    heartbeat,
   );
 
-  const heartbeatPath = path.join(dataDir, 'heartbeat');
   const poller = new PollerService(
     provider,
     stateService,
@@ -176,7 +179,7 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     mentionRouter,
     botUsername,
     intervalMs,
-    heartbeatPath,
+    heartbeat,
   );
 
   const shutdown = (): void => {

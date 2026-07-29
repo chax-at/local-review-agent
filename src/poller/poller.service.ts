@@ -44,7 +44,7 @@ export class PollerService {
   private readonly router: MentionRouter;
   private readonly botUsername: string;
   private readonly intervalMs: number;
-  private readonly heartbeatPath: string;
+  private readonly heartbeat: () => void;
   private shutdownRequested = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -57,7 +57,7 @@ export class PollerService {
     router: MentionRouter,
     botUsername: string,
     intervalMs: number,
-    heartbeatPath: string,
+    heartbeat: () => void,
   ) {
     this.provider = provider;
     this.state = state;
@@ -67,7 +67,7 @@ export class PollerService {
     this.router = router;
     this.botUsername = botUsername;
     this.intervalMs = intervalMs;
-    this.heartbeatPath = heartbeatPath;
+    this.heartbeat = heartbeat;
   }
 
   public async start(): Promise<void> {
@@ -105,7 +105,7 @@ export class PollerService {
 
   private async pollCycle(): Promise<void> {
     LogSink.info('Starting poll cycle...', TraceTags.POLLER);
-    this.writeHeartbeat();
+    this.heartbeat();
     this.cleanupTempDir();
     this.carrotConfig.resetCycleCarrotGaps();
     this.carrotConfig.clearCache();
@@ -196,6 +196,9 @@ export class PollerService {
 
     for (const pr of eligiblePrs) {
       if (this.shutdownRequested) break;
+      // Reviewing one PR can block for minutes; tick before each so the
+      // container health signal tracks progress, not cycle start.
+      this.heartbeat();
 
       try {
         const prState = this.state.getPrState(repoKey, String(pr.id));
@@ -597,14 +600,6 @@ export class PollerService {
       `Revert PR #${revertPrId} created to undo commit \`${commitHash.slice(0, 7)}\`.`,
     );
     return `Revert PR #${revertPrId} for commit \`${commitHash.slice(0, 7)}\`.`;
-  }
-
-  private writeHeartbeat(): void {
-    try {
-      fs.writeFileSync(this.heartbeatPath, new Date().toISOString());
-    } catch (err) {
-      LogSink.warn(`Failed to write heartbeat: ${err}`, TraceTags.POLLER);
-    }
   }
 
   /**

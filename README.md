@@ -613,8 +613,8 @@ On Bitbucket Cloud deployments, the `PROJECT/slug` repo key becomes `workspace/s
 
 ### Other data directories
 
-- `data/pi-dumps/` — last 10 AI outputs for debugging (timestamped JSONL)
-- `data/heartbeat` — written each poll cycle, used by Docker HEALTHCHECK
+- `data/pi-dumps/` — last 5 AI outputs for debugging (timestamped JSONL), capped at 200 MB total. A single reasoning trace can run to tens of megabytes, so the directory is pruned by size as well as by count; the newest dump is always kept even if it alone exceeds the budget.
+- `data/heartbeat` — liveness signal read by the Docker HEALTHCHECK. Touched before each poll cycle, each PR, and each review run: one review run calls pi through a synchronous `spawnSync` that blocks the event loop until Docker returns, so no timer can keep it fresh and the health window (1800s) has to exceed the worst-case single run (`MODELn_TIMEOUT_MS` + 30s startup + 60s per diff chunk).
 - `/tmp/carrot/<pid>/` — temp workspaces for one bot process, wiped at the start of each of its PR poll cycles. The dir is per-process on purpose: several instances (e.g. `start:server` and `start:cloud`) share `/tmp/carrot`, and wiping the whole root would delete the Docker workspace of a review another instance is running. Dirs of instances that are no longer running are reclaimed once they are older than 10 minutes.
 
 ---

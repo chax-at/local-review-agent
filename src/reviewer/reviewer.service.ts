@@ -201,6 +201,7 @@ export class ReviewerService {
   private readonly infoGatherer: InfoGatherer;
   private readonly deduplicator: FindingDeduplicator;
   private readonly maxValidators: number;
+  private readonly heartbeat: () => void;
 
   constructor(
     provider: IGitProvider,
@@ -214,6 +215,12 @@ export class ReviewerService {
     infoGatherer: InfoGatherer,
     deduplicator: FindingDeduplicator,
     maxValidators: number,
+    /**
+     * Liveness tick. Each pi run blocks the event loop for minutes (synchronous
+     * spawnSync), so no timer can keep the container health signal fresh — the
+     * review loop ticks between runs instead. Defaults to a no-op for tests.
+     */
+    heartbeat: () => void = () => {},
   ) {
     this.provider = provider;
     this.git = git;
@@ -226,6 +233,7 @@ export class ReviewerService {
     this.infoGatherer = infoGatherer;
     this.deduplicator = deduplicator;
     this.maxValidators = maxValidators;
+    this.heartbeat = heartbeat;
   }
 
   /**
@@ -471,6 +479,8 @@ export class ReviewerService {
     const allFindings: IAuthoredFinding[] = [];
     const reviewUsage: IModelUsage[] = [];
     for (const { model: rm, role } of runs) {
+      // Each run blocks the event loop for minutes — tick before every one.
+      this.heartbeat();
       try {
         const batch = rm.pi.reviewBatch(reviewable, standards, reviewCommentContext, dockerImage, PERSONA_DIRECTIVES[role]);
         for (const f of batch.findings) {

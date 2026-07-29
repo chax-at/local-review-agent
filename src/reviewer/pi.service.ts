@@ -35,6 +35,63 @@ function normalizeSeverity(severity: string): IReviewFinding['severity'] {
  */
 export const MAX_PI_OUTPUT_BYTES = 256 * 1024 * 1024;
 
+/** How many debug dumps of pi output to keep in data/pi-dumps. */
+export const MAX_PI_DUMPS = 5;
+
+/**
+ * Byte budget for the whole dump directory. A single reasoning trace can run to
+ * tens of megabytes (cumulative message_update events), so a count-only
+ * retention policy silently turns into gigabytes on disk.
+ */
+export const MAX_PI_DUMP_DIR_BYTES = 200 * 1024 * 1024;
+
+/**
+ * Enforce the dump retention policy: keep at most `maxFiles`, then drop the
+ * oldest until the directory fits `maxTotalBytes`. Dumps are named by ISO
+ * timestamp, so lexical order is chronological. The newest dump is always kept,
+ * even if it alone exceeds the budget — it is the one being debugged.
+ *
+ * Best-effort: every filesystem error is swallowed, since failing to prune must
+ * never fail a review.
+ */
+export function pruneDumpDir(dumpDir: string, maxFiles: number, maxTotalBytes: number): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dumpDir).sort();
+  } catch {
+    return;
+  }
+
+  const drop = (name: string): void => {
+    try {
+      fs.unlinkSync(path.join(dumpDir, name));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  for (const old of entries.slice(0, -maxFiles)) drop(old);
+
+  const kept = entries.slice(-maxFiles);
+  const sized = kept.map((name) => {
+    let size = 0;
+    try {
+      size = fs.statSync(path.join(dumpDir, name)).size;
+    } catch {
+      size = 0;
+    }
+    return { name, size };
+  });
+
+  let total = sized.reduce((sum, f) => sum + f.size, 0);
+  // Oldest first, never the last one standing.
+  for (const file of sized.slice(0, -1)) {
+    if (total <= maxTotalBytes) break;
+    drop(file.name);
+    total -= file.size;
+  }
+}
+
 /**
  * Create a run directory under this instance's temp dir. The temp dir is
  * per-process and recreated each poll cycle, so make sure it exists rather than
@@ -730,15 +787,7 @@ export class PiService {
       if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       fs.writeFileSync(path.join(dumpDir, `${ts}.jsonl`), output);
-      // Keep only the last 10 dumps
-      const files = fs.readdirSync(dumpDir).sort();
-      for (const old of files.slice(0, -10)) {
-        try {
-          fs.unlinkSync(path.join(dumpDir, old));
-        } catch {
-          /* ignore */
-        }
-      }
+      pruneDumpDir(dumpDir, MAX_PI_DUMPS, MAX_PI_DUMP_DIR_BYTES);
     } catch {
       /* ignore dump failure */
     }
