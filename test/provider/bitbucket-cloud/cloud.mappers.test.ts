@@ -22,6 +22,7 @@ describe('cloud.mappers.toPullRequestCloud', () => {
     const out = toPullRequestCloud({
       id: 5,
       title: 'feat: x',
+      description: 'Cloud PR body.',
       state: 'OPEN',
       draft: false,
       created_on: '2026-05-15T10:00:00Z',
@@ -33,6 +34,7 @@ describe('cloud.mappers.toPullRequestCloud', () => {
     expect(out).toEqual({
       id: 5,
       title: 'feat: x',
+      description: 'Cloud PR body.',
       draft: false,
       isOpen: true,
       createdAt: Date.parse('2026-05-15T10:00:00Z'),
@@ -42,6 +44,18 @@ describe('cloud.mappers.toPullRequestCloud', () => {
       targetBranch: 'main',
       authorUsername: 'alice',
     });
+  });
+
+  it('falls back to summary.raw and then empty string for the description', () => {
+    const base = {
+      id: 1, title: 't', state: 'OPEN',
+      created_on: '2026-01-01T00:00:00Z', updated_on: '2026-01-01T00:00:00Z',
+      source: { branch: { name: 'a' }, commit: { hash: 'h' } },
+      destination: { branch: { name: 'b' } },
+      author: { account_id: 'u' },
+    };
+    expect(toPullRequestCloud({ ...base, summary: { raw: 'from summary' } } as any).description).toBe('from summary');
+    expect(toPullRequestCloud(base as any).description).toBe('');
   });
 
   it('isOpen is false for non-OPEN states', () => {

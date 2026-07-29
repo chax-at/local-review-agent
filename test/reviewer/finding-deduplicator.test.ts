@@ -86,6 +86,47 @@ describe('FindingDeduplicator', () => {
     expect(result.findings.map((f) => f.comment).sort()).toEqual(['issue one', 'issue two']);
   });
 
+  it('records (author, persona) source pairs on the merged finding', async () => {
+    const llm = mockLlm('D1', cluster([{ memberIndexes: [0, 1], mergedComment: 'merged' }]));
+    const d = new FindingDeduplicator(llm);
+    const result = await d.dedupe([
+      authored({ author: 'R1', persona: 'security' }),
+      authored({ author: 'R2', persona: 'generic', line: 2 }),
+    ]);
+    expect(result.findings[0].sources).toEqual([
+      { author: 'R1', persona: 'security' },
+      { author: 'R2', persona: 'generic' },
+    ]);
+  });
+
+  it('drops identical (author, persona) pairs from sources but keeps distinct personas of one model', async () => {
+    const llm = mockLlm('D1', cluster([{ memberIndexes: [0, 1, 2], mergedComment: 'merged' }]));
+    const d = new FindingDeduplicator(llm);
+    const result = await d.dedupe([
+      authored({ author: 'R1', persona: 'security' }),
+      authored({ author: 'R1', persona: 'security', line: 2 }),
+      authored({ author: 'R1', persona: 'generic', line: 3 }),
+    ]);
+    expect(result.findings[0].sources).toEqual([
+      { author: 'R1', persona: 'security' },
+      { author: 'R1', persona: 'generic' },
+    ]);
+  });
+
+  it('leaves sources unset on findings that were not merged', async () => {
+    const llm = mockLlm(
+      'D1',
+      cluster([
+        { memberIndexes: [0], mergedComment: '' },
+        { memberIndexes: [1], mergedComment: '' },
+      ]),
+    );
+    const d = new FindingDeduplicator(llm);
+    const result = await d.dedupe([authored({ persona: 'security' }), authored({ author: 'R2', line: 2 })]);
+    expect(result.findings[0].sources).toBeUndefined();
+    expect(result.findings[1].sources).toBeUndefined();
+  });
+
   it('uses the highest severity and its line for the merged finding', async () => {
     const llm = mockLlm('D1', cluster([{ memberIndexes: [0, 1], mergedComment: 'merged' }]));
     const d = new FindingDeduplicator(llm);

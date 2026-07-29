@@ -13,10 +13,17 @@
   "Polling": {
     "IntervalMs": 300000
   },
+  "Jira": {
+    "BaseUrl": "",
+    "Email": "",
+    "ApiToken": "",
+    "ProjectKeys": ""
+  },
   "Review": {
     "MaxDiffLines": 5000,
     "MaxFileLines": 1000,
     "MaxInfoTokens": 8000,
+    "MaxExplorationTokens": 50000,
     "MaxValidators": 2
   },
   "Model1": {

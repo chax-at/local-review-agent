@@ -13,11 +13,13 @@ import { ensurePiRunnerImage } from './reviewer/pi-runner-image';
 import { LlmClient, type ILlmConfig } from './reviewer/llm-client';
 import { MultiModelValidator } from './reviewer/multi-model-validator';
 import { InfoGatherer } from './reviewer/info-gatherer';
+import { ContextExplorer } from './reviewer/context-explorer';
+import { JiraService } from './jira/jira.service';
 import { createHeartbeat } from './heartbeat';
 import { FindingDeduplicator } from './reviewer/finding-deduplicator';
 import { CarrotConfigService } from './config/carrot-config.service';
 import { MentionRouter } from './poller/mention-router';
-import { parseRoles, assertCorrectnessCovered } from './reviewer/personas';
+import { parseRoles, isCorrectnessCovered } from './reviewer/personas';
 
 export interface IBootstrapInput {
   provider: IGitProvider;
@@ -42,6 +44,7 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const maxDiffLines = config.get('Review.MaxDiffLines');
   const maxFileLines = config.get('Review.MaxFileLines');
   const maxInfoTokens = config.get('Review.MaxInfoTokens');
+  const maxExplorationTokens = config.get('Review.MaxExplorationTokens');
   const maxValidators = config.get('Review.MaxValidators');
   const workDir = config.get('WorkDir');
   const dataDir = config.get('DataDir');
@@ -106,8 +109,12 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const validators = modelKeys.map(buildLlmClient).filter(Boolean) as LlmClient[];
   const reviewModels = modelKeys.map(buildReviewModel).filter(Boolean) as IReviewModel[];
 
-  if (reviewModels.length > 0) {
-    assertCorrectnessCovered(reviewModels.map((m) => m.roles));
+  if (reviewModels.length > 0 && !isCorrectnessCovered(reviewModels.map((m) => m.roles))) {
+    LogSink.warn(
+      'No review model covers correctness (no "correctness" or "generic" role) — reviews will not hunt for bugs. ' +
+        'Intentional for specialized deployments; otherwise add the role to a review-enabled model.',
+      TraceTags.PI,
+    );
   }
 
   LogSink.debug(`Validation models: ${validators.map((v) => v.name).join(', ') || 'none'}`, TraceTags.DEBUG);
@@ -124,6 +131,16 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     LogSink.debug(`Info gatherer: ${validators[0].name} (budget ${maxInfoTokens} tokens)`, TraceTags.DEBUG);
   } else {
     LogSink.debug(`Info gatherer: disabled (no validator or MaxInfoTokens=0)`, TraceTags.DEBUG);
+  }
+
+  // Context explorer runs once per PR before the review pass, walking the repo
+  // from the diff (callers, type definitions) so the tool-less reviewers get
+  // cross-file context. Uses the first available validator, like the gatherer.
+  const contextExplorer = new ContextExplorer(validators[0] ?? null, maxExplorationTokens);
+  if (contextExplorer.isEnabled) {
+    LogSink.debug(`Context explorer: ${validators[0].name} (budget ${maxExplorationTokens} tokens)`, TraceTags.DEBUG);
+  } else {
+    LogSink.debug(`Context explorer: disabled (no validator or MaxExplorationTokens=0)`, TraceTags.DEBUG);
   }
 
   // Finding deduplicator: a single LLM (the first validator) collapses same-run
@@ -151,6 +168,39 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     }
   }
 
+  // Jira ticket context: read-only, optional. When configured, the reviewer
+  // pulls the PR's originating ticket (key parsed from branch/title/description)
+  // into pr-context.md for the review pass.
+  const jiraService = new JiraService(
+    config.get('Jira.BaseUrl'),
+    config.get('Jira.Email'),
+    config.get('Jira.ApiToken'),
+    config
+      .get('Jira.ProjectKeys')
+      .split(',')
+      .map((k) => k.trim())
+      .filter(Boolean),
+  );
+  LogSink.debug(
+    `Jira: ${jiraService.isEnabled ? `${config.get('Jira.BaseUrl')} (keys: ${config.get('Jira.ProjectKeys') || 'any'})` : 'disabled'}`,
+    TraceTags.DEBUG,
+  );
+  // Half-configured Jira silently yields no ticket context — that looks like
+  // "Jira has nothing to say about this PR", so make it loud.
+  const jiraBaseUrl = config.get('Jira.BaseUrl').trim();
+  const jiraToken = config.get('Jira.ApiToken').trim();
+  if (jiraBaseUrl !== '' && jiraToken === '') {
+    LogSink.warn(
+      `Jira is disabled: JIRA_BASE_URL is set (${jiraBaseUrl}) but JIRA_API_TOKEN is empty — no ticket context will be attached`,
+      TraceTags.JIRA,
+    );
+  } else if (jiraBaseUrl === '' && jiraToken !== '') {
+    LogSink.warn(
+      'Jira is disabled: JIRA_API_TOKEN is set but JIRA_BASE_URL is empty — no ticket context will be attached',
+      TraceTags.JIRA,
+    );
+  }
+
   const carrotConfigService = new CarrotConfigService(provider);
 
   const heartbeat = createHeartbeat(path.join(dataDir, 'heartbeat'));
@@ -167,6 +217,8 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     infoGatherer,
     deduplicator,
     maxValidators,
+    contextExplorer,
+    jiraService,
     heartbeat,
   );
 

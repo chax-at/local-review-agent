@@ -41,13 +41,60 @@ export interface IGatheredInfo {
 }
 
 /** Roughly 4 chars per token. Used to translate the token budget into a char cap. */
-const CHARS_PER_TOKEN = 4;
+export const CHARS_PER_TOKEN = 4;
 /** Per-block char cap so one giant file can't eat the per-call budget. */
-const MAX_BLOCK_CHARS = 16000;
+export const MAX_BLOCK_CHARS = 16000;
 /** Hard cap on actions a single gather call may request, to bound execution time. */
 const MAX_ACTIONS = 10;
 /** Max hits per search result (the rest are dropped). */
 const MAX_SEARCH_HITS = 8;
+
+/**
+ * Execute one LLM-proposed info action (load a file / search a symbol) and
+ * render it as a markdown block capped at `cap` chars. Returns null when the
+ * target is empty, already fetched (tracked via the caller-owned `seenFiles`/
+ * `seenQueries` sets), missing, or the tool call fails. Shared by the
+ * pre-review ContextExplorer and the pre-validation InfoGatherer.
+ */
+export async function executeInfoAction(
+  action: { type: 'file' | 'search'; target: string },
+  tools: IInfoTool,
+  seenFiles: Set<string>,
+  seenQueries: Set<string>,
+  cap: number,
+): Promise<string | null> {
+  const target = action.target.trim();
+  if (!target) return null;
+
+  if (action.type === 'file') {
+    if (seenFiles.has(target)) return null;
+    seenFiles.add(target);
+    let content: string | null;
+    try {
+      content = await tools.readFile(target);
+    } catch (err) {
+      LogSink.debug(`Info action: readFile(${target}) threw: ${err}`, TraceTags.PI);
+      return null;
+    }
+    if (!content) return null;
+    return `## File \`${target}\`:\n\`\`\`\n${content.slice(0, cap)}\n\`\`\``;
+  }
+
+  // action.type === 'search'
+  if (seenQueries.has(target)) return null;
+  seenQueries.add(target);
+  let hits: ISearchHit[];
+  try {
+    hits = await tools.searchSymbol(target);
+  } catch (err) {
+    LogSink.debug(`Info action: searchSymbol(${target}) threw: ${err}`, TraceTags.PI);
+    return null;
+  }
+  if (hits.length === 0) return null;
+  const lines = hits.slice(0, MAX_SEARCH_HITS).map((h) => `${h.file}:${h.line}: ${h.snippet.slice(0, 240)}`);
+  const body = lines.join('\n').slice(0, cap);
+  return `## Search \`${target}\`:\n\`\`\`\n${body}\n\`\`\``;
+}
 
 export class InfoGatherer {
   constructor(
@@ -215,7 +262,7 @@ export class InfoGatherer {
       if (used >= charBudget) break;
       const remaining = charBudget - used;
       const perBlockCap = Math.min(remaining, MAX_BLOCK_CHARS);
-      const block = await this.executeAction(action, tools, seenFiles, seenQueries, perBlockCap);
+      const block = await executeInfoAction(action, tools, seenFiles, seenQueries, perBlockCap);
       if (!block) continue;
       blocks.push(block);
       used += block.length;
@@ -231,46 +278,6 @@ export class InfoGatherer {
       usage,
       actionsApplied,
     };
-  }
-
-  private async executeAction(
-    action: { type: 'file' | 'search'; target: string },
-    tools: IInfoTool,
-    seenFiles: Set<string>,
-    seenQueries: Set<string>,
-    cap: number,
-  ): Promise<string | null> {
-    const target = action.target.trim();
-    if (!target) return null;
-
-    if (action.type === 'file') {
-      if (seenFiles.has(target)) return null;
-      seenFiles.add(target);
-      let content: string | null;
-      try {
-        content = await tools.readFile(target);
-      } catch (err) {
-        LogSink.debug(`Info gatherer: readFile(${target}) threw: ${err}`, TraceTags.PI);
-        return null;
-      }
-      if (!content) return null;
-      return `## File \`${target}\`:\n\`\`\`\n${content.slice(0, cap)}\n\`\`\``;
-    }
-
-    // action.type === 'search'
-    if (seenQueries.has(target)) return null;
-    seenQueries.add(target);
-    let hits: ISearchHit[];
-    try {
-      hits = await tools.searchSymbol(target);
-    } catch (err) {
-      LogSink.debug(`Info gatherer: searchSymbol(${target}) threw: ${err}`, TraceTags.PI);
-      return null;
-    }
-    if (hits.length === 0) return null;
-    const lines = hits.slice(0, MAX_SEARCH_HITS).map((h) => `${h.file}:${h.line}: ${h.snippet.slice(0, 240)}`);
-    const body = lines.join('\n').slice(0, cap);
-    return `## Search \`${target}\`:\n\`\`\`\n${body}\n\`\`\``;
   }
 
   private trackUsage(response: ILlmResponse): IModelUsage {

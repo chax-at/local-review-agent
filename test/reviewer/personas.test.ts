@@ -3,7 +3,7 @@ import {
   REVIEW_PERSONAS,
   PERSONA_DIRECTIVES,
   parseRoles,
-  assertCorrectnessCovered,
+  isCorrectnessCovered,
   buildReviewPrompt,
 } from '../../src/reviewer/personas';
 
@@ -14,6 +14,10 @@ describe('parseRoles', () => {
 
   it('parses multiple roles and is case/space insensitive', () => {
     expect(parseRoles(' Security , Correctness ', 'Model2')).toEqual(['security', 'correctness']);
+  });
+
+  it('parses the vegetable-police role', () => {
+    expect(parseRoles('vegetable-police', 'Model2')).toEqual(['vegetable-police']);
   });
 
   it('defaults are NOT applied here — "generic" is just a normal role', () => {
@@ -37,17 +41,18 @@ describe('parseRoles', () => {
   });
 });
 
-describe('assertCorrectnessCovered', () => {
-  it('passes when a model has the correctness role', () => {
-    expect(() => assertCorrectnessCovered([['security'], ['correctness']])).not.toThrow();
+describe('isCorrectnessCovered', () => {
+  it('true when a model has the correctness role', () => {
+    expect(isCorrectnessCovered([['security'], ['correctness']])).toBe(true);
   });
 
-  it('passes when a model is generic (generic covers correctness)', () => {
-    expect(() => assertCorrectnessCovered([['security'], ['generic']])).not.toThrow();
+  it('true when a model is generic (generic covers correctness)', () => {
+    expect(isCorrectnessCovered([['security'], ['generic']])).toBe(true);
   });
 
-  it('throws when no model covers correctness or generic', () => {
-    expect(() => assertCorrectnessCovered([['security'], ['readability']])).toThrow(/No review model covers correctness/);
+  it('false when no model covers correctness or generic — a warning case, never a startup failure', () => {
+    expect(isCorrectnessCovered([['security'], ['readability']])).toBe(false);
+    expect(isCorrectnessCovered([['vegetable-police']])).toBe(false);
   });
 });
 
@@ -64,8 +69,35 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain('existing-comments.md');
   });
 
+  it('appends the context.md line when repository context is attached', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.generic, false, true);
+    expect(prompt).toContain('context.md');
+    expect(prompt).toContain('only report findings on lines that appear in the diff');
+  });
+
+  it('omits the context.md line when no repository context was gathered', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.generic, false, false);
+    expect(prompt).not.toContain('context.md');
+  });
+
   it('generic directive equals the current hardcoded focus line', () => {
     expect(PERSONA_DIRECTIVES.generic).toBe('Focus on: security issues, bugs, code standard violations.');
+  });
+
+  it('appends the pr-context.md line when PR/ticket intent info is attached', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.generic, false, false, true);
+    expect(prompt).toContain('pr-context.md');
+  });
+
+  it('omits the pr-context.md line when there is no PR/ticket info', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.generic, false, false, false);
+    expect(prompt).not.toContain('pr-context.md');
+  });
+
+  it('vegetable-police directive grounds the review in standards.md and demands rule citations', () => {
+    const directive = PERSONA_DIRECTIVES['vegetable-police'];
+    expect(directive).toContain('standards.md');
+    expect(directive.toLowerCase()).toContain('cite');
   });
 
   it('every allowlisted persona has a directive', () => {

@@ -17,6 +17,12 @@ export interface IAuthoredFinding extends IReviewFinding {
    * that produced one half of a merged finding can't rubber-stamp it.
    */
   contributingAuthors?: string[];
+  /**
+   * Set only on merged findings: the distinct (author, persona) pair of every
+   * member, for comment attribution ("Found by R1 (security), R2 (generic)").
+   * Unmerged findings describe their single source via `author`/`persona`.
+   */
+  sources?: Array<{ author: string; persona?: string }>;
 }
 
 export interface IPrState {

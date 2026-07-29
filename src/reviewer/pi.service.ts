@@ -292,6 +292,25 @@ export function buildLintScript(script: string): string {
   return `cd /repo && npm run ${script}`;
 }
 
+/**
+ * Build the in-container shell script that runs pi once per diff chunk, with
+ * `attachmentArgs` (already-joined ` @/workspace/...` file references) appended
+ * to every invocation and a separator echoed between chunks.
+ *
+ * Pure function — exported separately from `reviewBatch` so the attachment
+ * wiring can be unit-tested without spawning Docker.
+ */
+export function buildBatchScript(piBase: string, attachmentArgs: string, prompt: string, chunkCount: number): string {
+  const lines = ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')'];
+
+  for (let i = 0; i < chunkCount; i++) {
+    if (i > 0) lines.push(`echo "${CHUNK_SEPARATOR}"`);
+    lines.push(`${piBase} @/workspace/chunk-${i}.patch${attachmentArgs} "$PROMPT" || true`);
+  }
+
+  return lines.join('\n');
+}
+
 function pickNum(obj: Record<string, unknown>, keys: string[]): number | null {
   for (const k of keys) {
     const v = obj[k];
@@ -378,6 +397,18 @@ export interface IPiReviewResult {
   usage: IPiTokenUsage;
 }
 
+/** Optional context and overrides for a review batch — see reviewBatch. */
+export interface IReviewBatchOptions {
+  codeStandards?: string | null;
+  existingComments?: string | null;
+  /** Pre-review exploration output, attached as context.md. */
+  repoContext?: string | null;
+  /** PR title/description + Jira ticket blob, attached as pr-context.md. */
+  prInfo?: string | null;
+  dockerImageOverride?: string;
+  personaDirective?: string;
+}
+
 function extractFindings(output: string): IReviewFinding[] {
   const lines = output.trim().split('\n');
   LogSink.debug(`pi output: ${lines.length} lines`, TraceTags.PI);
@@ -427,12 +458,7 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
  * other provider uses pi's built-in base, so `apiBase` is intentionally
  * ignored for them (the `--model` CLI flag carries the model id).
  */
-export function buildProviderEnvArgs(
-  provider: string,
-  apiKey: string,
-  apiBase: string,
-  model: string,
-): string[] {
+export function buildProviderEnvArgs(provider: string, apiKey: string, apiBase: string, model: string): string[] {
   if (!apiKey) return [];
   const keyEnv = PROVIDER_API_KEY_ENV[provider] ?? 'AZURE_OPENAI_API_KEY';
   const args = ['-e', `${keyEnv}=${apiKey}`];
@@ -468,49 +494,58 @@ export class PiService {
   }
 
   public review(diffContent: string, codeStandards: string | null, dockerImageOverride?: string): IPiReviewResult {
-    return this.reviewBatch([diffContent], codeStandards, null, dockerImageOverride);
+    return this.reviewBatch([diffContent], { codeStandards, dockerImageOverride });
   }
 
   /**
    * Review multiple diff chunks in a single Docker container.
    * Installs pi once, then loops over all chunks inside the container.
+   *
+   * Optional context attachments (each skipped when empty):
+   *  - `codeStandards`    → standards.md         (repo guideline files)
+   *  - `prInfo`           → pr-context.md        (PR title/description + Jira ticket)
+   *  - `repoContext`      → context.md           (pre-review exploration output)
+   *  - `existingComments` → existing-comments.md (already-posted PR comments)
    */
-  public reviewBatch(
-    diffs: string[],
-    codeStandards: string | null,
-    existingComments: string | null,
-    dockerImageOverride?: string,
-    personaDirective: string = PERSONA_DIRECTIVES.generic,
-  ): IPiReviewResult {
+  public reviewBatch(diffs: string[], opts: IReviewBatchOptions = {}): IPiReviewResult {
     const tmpDir = makeRunDir('pi-');
     try {
       for (let i = 0; i < diffs.length; i++) {
         fs.writeFileSync(path.join(tmpDir, `chunk-${i}.patch`), diffs[i]);
       }
 
-      let standardsArg = '';
-      if (codeStandards) {
-        fs.writeFileSync(path.join(tmpDir, 'standards.md'), codeStandards);
-        standardsArg = ' @/workspace/standards.md';
-      }
+      const attachment = (name: string, content: string | null | undefined): string => {
+        if (!content || !content.trim()) return '';
+        fs.writeFileSync(path.join(tmpDir, name), content);
+        return ` @/workspace/${name}`;
+      };
 
-      let commentsArg = '';
-      if (existingComments && existingComments.trim()) {
-        fs.writeFileSync(path.join(tmpDir, 'existing-comments.md'), existingComments);
-        commentsArg = ' @/workspace/existing-comments.md';
-      }
+      const standardsArg = attachment('standards.md', opts.codeStandards);
+      const prInfoArg = attachment('pr-context.md', opts.prInfo);
+      const contextArg = attachment('context.md', opts.repoContext);
+      const commentsArg = attachment('existing-comments.md', opts.existingComments);
 
-      const prompt = buildReviewPrompt(personaDirective, Boolean(commentsArg));
+      const prompt = buildReviewPrompt(
+        opts.personaDirective ?? PERSONA_DIRECTIVES.generic,
+        Boolean(commentsArg),
+        Boolean(contextArg),
+        Boolean(prInfoArg),
+      );
 
       const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --no-tools`;
-      const script = this.buildBatchScript(piBase, standardsArg, commentsArg, prompt, diffs.length);
+      const script = buildBatchScript(
+        piBase,
+        `${standardsArg}${prInfoArg}${contextArg}${commentsArg}`,
+        prompt,
+        diffs.length,
+      );
       fs.writeFileSync(path.join(tmpDir, 'run.sh'), script);
 
       LogSink.info(`Invoking pi for review (Docker, ${diffs.length} chunk(s))...`, TraceTags.PI);
       const timeout = this.timeoutMs + DOCKER_INSTALL_BUFFER_MS + diffs.length * PER_CHUNK_TIMEOUT_MS;
       const output = this.dockerRun({
         mounts: [{ host: tmpDir, container: '/workspace' }],
-        imageOverride: dockerImageOverride,
+        imageOverride: opts.dockerImageOverride,
         timeout,
       });
 
@@ -643,23 +678,6 @@ export class PiService {
     return ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')', `${piCmd} "$PROMPT"`].join(
       '\n',
     );
-  }
-
-  private buildBatchScript(
-    piBase: string,
-    standardsArg: string,
-    commentsArg: string,
-    prompt: string,
-    chunkCount: number,
-  ): string {
-    const lines = ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')'];
-
-    for (let i = 0; i < chunkCount; i++) {
-      if (i > 0) lines.push(`echo "${CHUNK_SEPARATOR}"`);
-      lines.push(`${piBase} @/workspace/chunk-${i}.patch${standardsArg}${commentsArg} "$PROMPT" || true`);
-    }
-
-    return lines.join('\n');
   }
 
   private dockerRun(opts: {

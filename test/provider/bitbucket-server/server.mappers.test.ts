@@ -20,6 +20,7 @@ describe('server.mappers.toPullRequest', () => {
     const wire: IBitbucketPullRequest = {
       id: 42,
       title: 'Fix thing',
+      description: 'Implements the thing per ABC-7.',
       state: 'OPEN',
       open: true,
       draft: false,
@@ -44,6 +45,7 @@ describe('server.mappers.toPullRequest', () => {
     expect(toPullRequest(wire)).toEqual({
       id: 42,
       title: 'Fix thing',
+      description: 'Implements the thing per ABC-7.',
       draft: false,
       isOpen: true,
       createdAt: 1700000000000,
@@ -81,6 +83,7 @@ describe('server.mappers.toPullRequest', () => {
     expect(out.createdAt).toBe(null);
     expect(out.updatedAt).toBe(null);
     expect(out.isOpen).toBe(true);
+    expect(out.description).toBe('');
   });
 });
 
