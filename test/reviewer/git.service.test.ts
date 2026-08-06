@@ -150,7 +150,7 @@ describe('GitService', () => {
     it('performs the full reset when HEAD differs from origin/<branch>', () => {
       mockGitState({ currentBranch: 'feature', head: 'abc123', remoteHead: 'def456' });
       gitService.resetToRemoteBranch('PROJ', 'repo', 'feature');
-      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', 'feature'], expect.any(Object));
+      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', '-f', 'feature'], expect.any(Object));
       expect(execFileSync).toHaveBeenCalledWith('git', ['reset', '--hard', 'origin/feature'], expect.any(Object));
       expect(execFileSync).toHaveBeenCalledWith('git', ['clean', '-fd'], expect.any(Object));
     });
@@ -164,13 +164,21 @@ describe('GitService', () => {
     it('performs the full reset when on a different branch even at the same commit', () => {
       mockGitState({ currentBranch: 'other', head: 'abc123', remoteHead: 'abc123', status: '' });
       gitService.resetToRemoteBranch('PROJ', 'repo', 'feature');
-      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', 'feature'], expect.any(Object));
+      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', '-f', 'feature'], expect.any(Object));
+    });
+
+    it('force-checkouts the branch so phantom-dirty files (EOL renormalization) cannot abort the switch', () => {
+      // A file whose committed blob contradicts .gitattributes shows as modified
+      // even right after `reset --hard`, so a plain checkout would refuse to run.
+      mockGitState({ currentBranch: 'other', head: 'abc123', remoteHead: 'abc123', status: ' M gradlew.bat\n' });
+      gitService.resetToRemoteBranch('PROJ', 'repo', 'feature');
+      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', '-f', 'feature'], expect.any(Object));
     });
 
     it('performs the full reset when HEAD is detached (symbolic-ref fails)', () => {
       mockGitState({ currentBranch: new Error('fatal: ref HEAD is not a symbolic ref'), head: 'abc123', remoteHead: 'abc123', status: '' });
       gitService.resetToRemoteBranch('PROJ', 'repo', 'feature');
-      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', 'feature'], expect.any(Object));
+      expect(execFileSync).toHaveBeenCalledWith('git', ['checkout', '-f', 'feature'], expect.any(Object));
     });
   });
 

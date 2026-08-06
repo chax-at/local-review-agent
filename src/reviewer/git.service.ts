@@ -191,7 +191,9 @@ export class GitService {
     // before switching branches — otherwise checkout fails on dirty working tree.
     this.execGit(['reset', '--hard', 'HEAD'], { cwd: repoDir, stdio: 'pipe' });
     this.execGit(['clean', '-fd'], { cwd: repoDir, stdio: 'pipe' });
-    this.execGit(['checkout', branch], { cwd: repoDir, stdio: 'pipe' });
+    // -f: a file whose committed blob contradicts .gitattributes EOL rules shows
+    // as modified even right after `reset --hard`, and would abort a plain checkout.
+    this.execGit(['checkout', '-f', branch], { cwd: repoDir, stdio: 'pipe' });
     this.execGit(['reset', '--hard', `origin/${branch}`], { cwd: repoDir, stdio: 'pipe' });
   }
 
