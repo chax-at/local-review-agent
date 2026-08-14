@@ -1,0 +1,97 @@
+---
+# Builds a reproducible image on every push to public-main, pushes it to this
+# repo's Forgejo container registry, then deploys it to both production
+# instances (the Bitbucket Server poller and the cloud poller), which run
+# side by side on the same host with separate persisted data/repos dirs.
+#
+# Required repo secrets: SSH_PRIVATE_KEY, DEPLOY_PRODUCTION_USERNAME,
+# DEPLOY_PRODUCTION_HOSTNAME. FORGEJO_TOKEN is injected automatically.
+# Optional repo variable: DEPLOY_PATH (defaults to /srv/local-git-reviewer).
+#
+# Adjust `runs-on: docker` below if your runner uses a different label.
+name: deploy
+
+on:
+  push:
+    branches: [public-main]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_REF: forge.chax.at/chax-local-git-reviewer/local-git-reviewer
+
+jobs:
+  verify:
+    runs-on: docker
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+      - uses: https://data.forgejo.org/actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm run ci:lint
+      - run: npm run ci:typecheck
+      - run: npm run ci:test
+      - run: npm run ci:audit
+
+  build-and-push:
+    needs: verify
+    runs-on: docker
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+      - uses: https://data.forgejo.org/docker/setup-buildx-action@v3
+      - uses: https://data.forgejo.org/docker/login-action@v3
+        with:
+          registry: forge.chax.at
+          username: ${{ github.actor }}
+          password: ${{ secrets.FORGEJO_TOKEN }}
+      - uses: https://data.forgejo.org/docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_REF }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: docker
+    strategy:
+      matrix:
+        instance: [server, cloud]
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}" >> ~/.ssh/known_hosts
+
+      - name: Sync compose file(s)
+        run: |
+          remote_dir="${{ vars.DEPLOY_PATH || '/srv/local-git-reviewer' }}/${{ matrix.instance }}"
+          files="docker-compose.yml"
+          if [ "${{ matrix.instance }}" = "cloud" ]; then
+            files="$files docker-compose.cloud.yml"
+          fi
+          rsync -az -e "ssh -i ~/.ssh/deploy_key" $files \
+            "${{ secrets.DEPLOY_PRODUCTION_USERNAME }}@${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}:$remote_dir/"
+
+      - name: Pull and restart
+        run: |
+          remote_dir="${{ vars.DEPLOY_PATH || '/srv/local-git-reviewer' }}/${{ matrix.instance }}"
+          compose_files="-f docker-compose.yml"
+          if [ "${{ matrix.instance }}" = "cloud" ]; then
+            compose_files="$compose_files -f docker-compose.cloud.yml"
+          fi
+          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_PRODUCTION_USERNAME }}@${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}" bash -s <<EOF
+            set -euo pipefail
+            cd "$remote_dir"
+            echo "${{ secrets.FORGEJO_TOKEN }}" | docker login forge.chax.at -u "${{ github.actor }}" --password-stdin
+            image="${{ env.IMAGE_REF }}" tag="${{ github.sha }}" docker compose $compose_files pull
+            image="${{ env.IMAGE_REF }}" tag="${{ github.sha }}" docker compose $compose_files up -d --remove-orphans
+            docker logout forge.chax.at
+          EOF
