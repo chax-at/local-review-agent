@@ -3,8 +3,11 @@
 ARG from_registry=docker.io
 ARG from_repository=library/node
 ARG from_tag=24
-FROM ${from_registry}/${from_repository}:${from_tag} as base_nodejs
+FROM ${from_registry}/${from_repository}:${from_tag} AS base_nodejs
 USER www-data
+# node:24's www-data has no home dir (/var/www doesn't exist), so npm's cache
+# write fails under this user unless HOME points somewhere it owns.
+ENV HOME=/srv/www/app
 WORKDIR /srv/www/app
 
 
