@@ -21,6 +21,7 @@ export function toPullRequest(wire: IBitbucketPullRequest): IPullRequest {
   return {
     id: wire.id,
     title: wire.title,
+    description: wire.description ?? '',
     draft: wire.draft ?? false,
     isOpen: wire.state === 'OPEN',
     createdAt: wire.createdDate ?? null,

@@ -11,6 +11,7 @@ export interface IBitbucketRef {
 export interface IBitbucketPullRequest {
   id: number;
   title: string;
+  description?: string;
   state: string;
   open: boolean;
   draft?: boolean;

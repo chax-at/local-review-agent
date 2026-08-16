@@ -168,6 +168,12 @@ export class FindingDeduplicator {
     const contributingAuthors = [...new Set(members.map((m) => m.author))];
     const comment = mergedComment.trim() || members.map((m) => m.comment).join('\n\n');
 
+    // Distinct (author, persona) pairs across members, for comment attribution.
+    // flatMap unwraps members that are themselves merge products.
+    const sources = members
+      .flatMap((m) => m.sources ?? [{ author: m.author, persona: m.persona }])
+      .filter((s, i, all) => all.findIndex((o) => o.author === s.author && o.persona === s.persona) === i);
+
     return {
       filePath: anchor.filePath,
       line: anchor.line,
@@ -175,6 +181,7 @@ export class FindingDeduplicator {
       comment,
       author: anchor.author,
       contributingAuthors,
+      sources,
     };
   }
 

@@ -1,0 +1,7 @@
+---
+# Override for docker-compose.yml: runs the cloud poller instead of the
+# Bitbucket Server poller. Apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.cloud.yml up -d
+services:
+  local-git-reviewer:
+    command: ["node", "dist/src/main-cloud.js"]

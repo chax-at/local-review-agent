@@ -46,7 +46,7 @@ cp .env.sample .env
 | `MODEL1_INPUT_COST` | Optional | Cost per 1M input tokens (for cost tracking in review comments) |
 | `MODEL1_OUTPUT_COST` | Optional | Cost per 1M output tokens |
 | `MODEL1_REVIEW` | Optional | Set `true` to run the review pass (Docker pi-runner) with this model; the first review-enabled model also handles fix/propose/lint |
-| `MODEL1_ROLES` | Optional | Review personas this model runs, comma-separated (e.g. `security,correctness`). The model runs the review pass **once per role**, each with a role-focused prompt. Allowed: `correctness`, `security`, `readability`, `generic` (all-round). Default: `generic`. At least one review model must cover `correctness` or `generic`, or startup fails. See [Review personas](#review-personas-roles). |
+| `MODEL1_ROLES` | Optional | Review personas this model runs, comma-separated (e.g. `security,correctness`). The model runs the review pass **once per role**, each with a role-focused prompt. Allowed: `correctness`, `security`, `readability`, `generic` (all-round), `vegetable-police` (guideline compliance; auto-skipped for repos without guideline files). Default: `generic`. If no review model covers `correctness` or `generic`, the bot starts with a warning (valid for specialized deployments). See [Review personas](#review-personas-roles). |
 | `MODEL1_VALIDATE` | Optional | Set `false` to exclude this model from the validator pool (defaults to `true`). Use for review-only deployments whose endpoint doesn't speak `/chat/completions` — e.g. Azure responses-API codex models — so the bot doesn't try to vote with them and 400. |
 | `MODEL1_PROVIDER` | When `MODEL1_REVIEW=true` | pi-runner provider — must match the model. Supported: `anthropic`, `google` (Gemini), `openai`, `azure-openai-responses`, `openrouter`, `xai`, `deepseek`, `mistral`, `groq`. The key is forwarded to pi under that provider's env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, …). Defaults to `azure-openai-responses` — a Claude/Gemini model left on that default returns a 404. |
 | `MODEL1_DOCKER_IMAGE` | When `MODEL1_REVIEW=true` | Docker image for the pi-runner container (e.g. `lgr-pi-runner:latest`) |
@@ -55,7 +55,19 @@ cp .env.sample .env
 | `REVIEW_MAX_DIFF_LINES` | Optional | Diffs larger than this line count are skipped (default: 5000) |
 | `REVIEW_MAX_FILE_LINES` | Optional | Files larger than this line count are skipped in review (default: 1000) |
 | `REVIEW_MAX_INFO_TOKENS` | Optional | Token budget for the info-gatherer's added context (DTOs / symbol matches). Roughly 4 chars per token. Set `0` to disable info-gathering. Default: 8000. |
+| `REVIEW_MAX_EXPLORATION_TOKENS` | Optional | Token budget for the pre-review context exploration pass (agentic loop, ≤ 3 rounds) whose result is attached as `context.md` to every reviewer run. Roughly 4 chars per token. Every reviewer run's input grows by up to this budget, so cost scales with the run count. Set `0` to disable exploration. Default: 50000. |
 | `REVIEW_MAX_VALIDATORS` | Optional | Cap on the number of validators that vote per PR. If more validator-enabled models are configured, a random subset of this size is picked per PR and reused across round 1, round 2, suggestion votes, and fix-prompt drafting. Set `0` for no cap. Default: 2. |
+
+### Jira (optional ticket context)
+
+When configured, each review resolves the PR's originating Jira ticket — the key is parsed from the source branch name, then the PR title, then the PR description (first hit wins) — and attaches its summary, description, and the 10 most recent comments to every reviewer run inside `pr-context.md`, alongside the PR title/description. The discussion is included because that is where scope is renegotiated after the description was written ("we decided not to do X", "also needs Y"); reviewers are told to prefer it over the description where the two disagree. Comments are flattened from plain text or ADF, capped at 800 chars each and 4 KB for the section, and rendered oldest-first. Reading is the only operation performed; failures (Jira down, key not found) cost nothing but the ticket section.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_BASE_URL` | Optional | e.g. `https://yourcompany.atlassian.net`. Empty disables the integration. |
+| `JIRA_EMAIL` | Cloud only | Set together with an API token → Basic auth (`email:token`). Leave empty on Server/Data Center to use Bearer PAT auth instead. |
+| `JIRA_API_TOKEN` | With base URL | Cloud API token or Server/DC personal access token. |
+| `JIRA_PROJECT_KEYS` | Optional | Comma-separated allowlist of project keys (e.g. `ABC,CORE`). Without it any `KEY-123`-shaped string matches, with well-known non-tickets (`ISO-8601`, `SHA-256`, `RFC-…`, `CVE-…`) ignored. Set it if you see false matches. |
 
 ### Bitbucket Cloud (alternative to Server)
 
@@ -242,6 +254,9 @@ A single polling loop runs on a configurable interval (default: 5 minutes). Each
 | `src/reviewer/multi-model-validator.ts` | Council validation of findings, suggestions, and fixes (2-round voting) |
 | `src/reviewer/finding-deduplicator.ts` | Single-LLM pass that merges same-run duplicate findings before the council |
 | `src/reviewer/info-gatherer.ts` | Per-file context expansion (extra files / symbol search) for validators |
+| `src/reviewer/context-explorer.ts` | Pre-review agentic exploration pass; produces the `context.md` shared by all reviewer runs |
+| `src/reviewer/pr-context.ts` | Assembles `pr-context.md` (PR title/description + Jira ticket) for reviewer runs |
+| `src/jira/jira.service.ts` | Read-only Jira client + ticket-key extraction from branch/title/description |
 | `src/reviewer/llm-client.ts` | OpenAI-compatible API wrapper |
 | `src/reviewer/llm-schemas.ts` | Zod schemas for structured LLM outputs |
 | `src/reviewer/diff.utils.ts` | Diff splitting, filtering, batching |
@@ -405,7 +420,7 @@ All fix PRs have `deleteSourceBranchOnMerge` enabled.
 
 ## Multi-model review and validation
 
-The bot supports four general-purpose models (`Model1`–`Model4`). Each model is by default a **validator**; setting `MODELn_REVIEW=true` additionally enrolls it in the **review** pool (which runs the Docker pi-runner). The first validator-enabled model also doubles as the **info-gatherer**.
+The bot supports four general-purpose models (`Model1`–`Model4`). Each model is by default a **validator**; setting `MODELn_REVIEW=true` additionally enrolls it in the **review** pool (which runs the Docker pi-runner). The first validator-enabled model also doubles as the **context explorer** (pre-review) and the **info-gatherer**.
 
 **Every `MODELn_REVIEW=true` model runs on each PR** (see [Review personas](#review-personas-roles) for how each model's roles expand into runs). **Validators** are capped at `REVIEW_MAX_VALIDATORS` (default 2; set `0` for no cap): if more validator-enabled models are configured, a random subset of that size votes per PR — different PRs may see different validators, giving cost-bounded diversity. Within a single PR the picked validator subset is stable: round 1, round 2, suggestion votes, and fix-prompt drafting all see the same validators.
 
@@ -419,23 +434,27 @@ Each review model is assigned one or more **roles** via `MODELn_ROLES` (comma-se
 | `security` | Injection, unsafe input, auth/authorization gaps, secret exposure, unsafe deserialization, weak crypto |
 | `readability` | Naming, dead code, duplication, unclear intent, code-standard violations |
 | `generic` | All-round review (the original single-prompt behavior) |
+| `vegetable-police` | Compliance with the repo's own guideline files for agents/reviewers (CLAUDE.md / AGENTS.md / carrot `rulesFiles`, i.e. exactly what `standards.md` carries). Flags every diff change that violates a written rule and cites the rule. **Runs only when the repo actually has guideline files** — with none to enforce, the run is skipped (per PR, logged, no cost). |
 
-So the number of review pi-runs per PR is the **sum of roles across all review models** — two models with two roles each is four runs. Every review-enabled model runs every PR (there is no reviewer cap), so keep role lists modest to bound cost. Findings are tagged with both the authoring model and the role that produced them, and flow into the same dedup + validation pipeline. At startup the bot validates every role string and **refuses to run** unless some review model covers `correctness` (an explicit `correctness` role, or any `generic` model); unknown or duplicate roles also fail fast.
+So the number of review pi-runs per PR is the **sum of roles across all review models** — two models with two roles each is four runs. Every review-enabled model runs every PR (there is no reviewer cap), so keep role lists modest to bound cost. Findings are tagged with both the authoring model and the role that produced them, and flow into the same dedup + validation pipeline. At startup the bot validates every role string — unknown or duplicate roles fail fast. If no review model covers `correctness` (an explicit `correctness` role, or any `generic` model) the bot still starts but logs a warning, since a council that can't catch bugs is usually a misconfiguration — running that way deliberately (e.g. a guidelines-only `vegetable-police` deployment) is a supported operator choice.
 
 ### End-to-end review workflow
 
-Each PR review walks through eight stages. Every stage is best-effort: if a stage fails or has nothing to do, the pipeline continues with degraded but well-defined behavior.
+Each PR review walks through nine stages. Every stage is best-effort: if a stage fails or has nothing to do, the pipeline continues with degraded but well-defined behavior.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  1. clone/fetch + compute diff (origin/target...origin/source)       │
-│  2. review pass (one run per model × role), each shown the existing  │
-│     PR comments so it won't re-raise addressed issues  → findings[]  │
-│  3. fetch whole files (provider API)                → contentByPath  │
-│  4. filter findings on files > MaxFileLines         → keptFindings[] │
-│  5. same-run dedup (single LLM pass, per file)      → dedupedFnds[]  │
-│  6. info-gather PROACTIVE (one LLM call per file)   → ctxByFile      │
-│  7. validation (≤MaxValidators, authors deprioritized):              │
+│  1. clone/fetch + compute diff; gather PR intent (title/description  │
+│     + Jira ticket when configured)                  → pr-context.md  │
+│  2. context exploration (agentic loop, ≤3 rounds,                    │
+│     steered by the PR intent)                       → context.md     │
+│  3. review pass (one run per model × role), each shown the existing  │
+│     PR comments + pr-context.md + context.md        → findings[]     │
+│  4. fetch whole files (provider API)                → contentByPath  │
+│  5. filter findings on files > MaxFileLines         → keptFindings[] │
+│  6. same-run dedup (single LLM pass, per file)      → dedupedFnds[]  │
+│  7. info-gather PROACTIVE (one LLM call per file)   → ctxByFile      │
+│  8. validation (≤MaxValidators, authors deprioritized):              │
 │       round 1 (per-file groups, council votes + infoRequest field)   │
 │       ├─ unanimous keep        → kept                                │
 │       ├─ unanimous reject      → discarded                           │
@@ -443,22 +462,24 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 │                                  → round 2 deliberation              │
 │                                  ├─ all reject  → discarded          │
 │                                  └─ otherwise   → kept               │
-│  8. propose code suggestions + validate (2-round council)            │
+│  9. propose code suggestions + validate (2-round council)            │
 │     post inline comments (best-effort) + algorithmic summary         │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Stage 1 — Clone/fetch + diff.** `GitService.cloneOrFetch` ensures the local repo is up to date; `GitService.getDiff` produces a three-dot diff against the merge base. If the diff is empty, the review aborts cleanly with no comment.
+**Stage 1 — Clone/fetch + diff + PR intent.** `GitService.cloneOrFetch` ensures the local repo is up to date; `GitService.getDiff` produces a three-dot diff against the merge base. If the diff is empty, the review aborts cleanly with no comment. In parallel with the mechanics, the PR's *intent* is gathered into `pr-context.md`: title + description from the provider, plus — when Jira is configured — the originating ticket's summary, description, and 10 most recent comments (key parsed from branch name, then title, then description; both bodies capped at 4 KB each, the discussion at 800 chars per comment within a 4 KB section). Every part degrades to absent on failure; the blob is fed to the exploration pass and attached to every reviewer run. The prompt marks it explicitly as untrusted description that never overrides review instructions.
 
-**Stage 2 — Review pass.** Every review-enabled model runs the pi-runner inside Docker against the diff and returns its own findings (`{filePath, line, severity, comment}`) — once per assigned [role](#review-personas-roles), so the run count is the sum of roles across all review models. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. Findings are tagged with the authoring model and role. Findings on lockfiles are dropped automatically. If *all* active review runs fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
+**Stage 2 — Context exploration.** The review pass is deliberately diff-only (`--no-tools`, no repo mount), which makes cross-file bugs invisible to it. This stage compensates: a small agentic loop (the first validator model, up to 3 rounds) walks the repository starting from the diff — and steered by the PR intent from stage 1 — proposing `file` / `search` actions, seeing the results, and following leads (callers of changed functions, type definitions, contracts the changed code must uphold). The gathered blocks are assembled into one markdown blob, capped at `REVIEW_MAX_EXPLORATION_TOKENS × 4` chars, and attached as `context.md` to **every** reviewer run — exploration cost is paid once per PR, not once per (model × role). Reviewers stay tool-less and injection-inert. Failure here (or `REVIEW_MAX_EXPLORATION_TOKENS=0`, or no validator) degrades to a plain diff-only review.
 
-**Stage 3 — Fetch whole files.** For each distinct finding path (excluding lockfiles), the provider's `getFileContent` is called once at the source branch. This populates `fileContentByPath`, used both for the line-count check and as full-file context for validators.
+**Stage 3 — Review pass.** Every review-enabled model runs the pi-runner inside Docker against the diff and returns its own findings (`{filePath, line, severity, comment}`) — once per assigned [role](#review-personas-roles), so the run count is the sum of roles across all review models. Each reviewer is also shown the **existing PR comments** (grouped per file, capped at the most recent 60 comments × 500 chars each) and instructed not to re-raise issues that are already addressed — this replaces the old mechanical "same file/line/prefix" dedup filter, which was brittle against rewording. When stage 2 gathered anything, each reviewer also receives the shared `context.md` with instructions to use it for judging but to report findings only on diff lines; when stage 1 produced a `pr-context.md`, that is attached too, so reviewers can flag code-vs-intent mismatches. Findings are tagged with the authoring model and role. Findings on lockfiles are dropped automatically. If *all* active review runs fail, the bot posts an "Automated review failed" comment instead of a misleading "no issues" summary. If the diff is over `REVIEW_MAX_DIFF_LINES`, it's split per-file and packed into batches before review.
 
-**Stage 4 — File-size filter.** Findings on files over `REVIEW_MAX_FILE_LINES` (default 1000) are dropped (those files are noted in the summary as "skipped").
+**Stage 4 — Fetch whole files.** For each distinct finding path (excluding lockfiles), the provider's `getFileContent` is called once at the source branch. This populates `fileContentByPath`, used both for the line-count check and as full-file context for validators.
 
-**Stage 5 — Same-run dedup.** With multiple review models, the same issue is often flagged twice with different wording. A dedicated single-LLM pass (the first validator, one call per file with 2+ findings, calls run in parallel) clusters duplicates and merges each cluster into one finding whose comment combines every triggering reason. The merged finding records **every contributing author** (`contributingAuthors`), so no contributor can later vote on it in the council. Fail-safe: any model or parse error keeps that file's findings unmerged — a finding is never dropped because dedup failed.
+**Stage 5 — File-size filter.** Findings on files over `REVIEW_MAX_FILE_LINES` (default 1000) are dropped (those files are noted in the summary as "skipped").
 
-**Stage 6 — Info-gather, proactive pass.** Before any validator votes, the bot expands the context.
+**Stage 6 — Same-run dedup.** With multiple review models, the same issue is often flagged twice with different wording. A dedicated single-LLM pass (the first validator, one call per file with 2+ findings, calls run in parallel) clusters duplicates and merges each cluster into one finding whose comment combines every triggering reason. The merged finding records **every contributing author** (`contributingAuthors`), so no contributor can later vote on it in the council. Fail-safe: any model or parse error keeps that file's findings unmerged — a finding is never dropped because dedup failed.
+
+**Stage 7 — Info-gather, proactive pass.** Before any validator votes, the bot expands the context.
 - The working tree is reset to the source branch first (so `git grep` searches the right code).
 - Findings are grouped by file, and **one LLM call runs per finding-file** (in parallel). Each call sees only that file's findings plus the diff and asks: "what extra files / symbols would help validators judge these?"
 - The LLM returns `{actions: [{type: 'file'|'search', target: '<path or symbol>'}, …]}`. Actions are executed: `file` actions go through `provider.getFileContent`, `search` actions run `execFileSync('git', ['grep', ...])` against the (now-reset) working tree.
@@ -466,7 +487,7 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
 - Result: `additionalContextByFile: Map<filePath, string>`. Each file's blob is injected only into that file's validator group prompt later — no cross-file contamination.
 - The info-gatherer model is `validators[0]` — the first `MODELn_VALIDATE`-enabled model, which is also the deduplicator; re-order your validators to use a cheaper model in these roles. If no validator exists or `REVIEW_MAX_INFO_TOKENS=0`, the stage is a no-op and the pipeline carries on with no extra context.
 
-**Stage 7a — Validation, round 1.** Findings are split into per-file groups. The active validator pool ([chosen per PR](#multi-model-review-and-validation)) **deprioritizes this PR's finding authors**: a model can't vote on findings it (co-)authored, so sampling a reviewer would waste a validator slot — authors are only sampled when there aren't enough non-author validators to fill the subset. For each group, **every active model except the finding's author(s)** is asked to vote (for merged findings, all `contributingAuthors` are excluded).
+**Stage 8a — Validation, round 1.** Findings are split into per-file groups. The active validator pool ([chosen per PR](#multi-model-review-and-validation)) **deprioritizes this PR's finding authors**: a model can't vote on findings it (co-)authored, so sampling a reviewer would waste a validator slot — authors are only sampled when there aren't enough non-author validators to fill the subset. For each group, **every active model except the finding's author(s)** is asked to vote (for merged findings, all `contributingAuthors` are excluded).
 - The model returns `{results: [{index, relevant, thought, infoRequest}, …]}`. The `infoRequest` field (free text — a specific path or symbol) flags "I'd need more context to judge this confidently".
 - The schema is sent strict via JSON Schema, but parsing is **lenient**: if a model (e.g. one with `SUPPORTS_STRUCTURED_OUTPUT=false`) returns the base shape without `infoRequest`, its vote is still accepted with an empty request.
 - Per finding, the votes are tallied:
@@ -475,21 +496,21 @@ Each PR review walks through eight stages. Every stage is best-effort: if a stag
   - **Split** → contested, sent to round 2.
 - The author rule ensures a model can't validate its own opinion. If a finding's *only* eligible voter is the author, the finding is conservatively kept with no notes.
 
-**Stage 7b — Info-gather, follow-up pass.** Only triggered if at least one contested finding has a non-empty `infoRequest`.
+**Stage 8b — Info-gather, follow-up pass.** Only triggered if at least one contested finding has a non-empty `infoRequest`.
 - Requests are grouped by the finding's file (within-file dedup so the same DTO ask from 3 validators only fetches once).
 - The gatherer runs one LLM call **only for the files that filed requests** (`onlyRequested=true`). Each call sees the validator requests as the primary signal and translates them into actions, same per-file budget.
 - New per-file blobs are merged into the existing `additionalContextByFile` (concatenated, not replaced), so round 2 sees both the proactive context and the new follow-up context.
 - Failure here degrades silently: round 2 just runs with whatever context already existed.
 
-**Stage 7c — Validation, round 2 (deliberation).** Contested findings are re-asked, this time each model also sees **every peer's round-1 reasoning**. Same author-exclusion. Schema is the base `FindingsValidationSchema` (no `infoRequest` — info-gathering is done by this point).
+**Stage 8c — Validation, round 2 (deliberation).** Contested findings are re-asked, this time each model also sees **every peer's round-1 reasoning**. Same author-exclusion. Schema is the base `FindingsValidationSchema` (no `infoRequest` — info-gathering is done by this point).
 - A finding is discarded only if every responding round-2 voter rejects it; any defender keeps it. This is intentionally biased toward keeping signal.
 - All vote entries (round 1 + round 2, every model) are rendered into the final inline comment as a "Valid finding / Not important" block under each finding, so the human reader can see the disagreement.
 
-**Stage 8 — Code suggestions.** For every kept finding, the primary review model's pi-runner is asked to `proposeFixes`. Replace-proposals go through the same 2-round council vote (`validateSuggestions`). Approved suggestions are attached to the inline comment as ```suggestion blocks; rejected ones are silently dropped.
+**Stage 9 — Code suggestions.** For every kept finding, the primary review model's pi-runner is asked to `proposeFixes`. Replace-proposals go through the same 2-round council vote (`validateSuggestions`). Approved suggestions are attached to the inline comment as ```suggestion blocks; rejected ones are silently dropped.
 
-**Posting.** Inline comments are posted **best-effort**: one rejected comment (e.g. out-of-diff anchor) is logged and skipped, not fatal. Only if *every* comment fails does the run throw — nothing was posted, so the retry next cycle can't duplicate. The summary post is also non-fatal: once inline comments are out, a failed summary must not prevent the poller from saving review state (that would re-post everything next cycle).
+**Posting.** Each inline comment carries a `*Found by …*` attribution line naming the model(s) and persona(s) that produced the finding — e.g. `Found by Model1 (security)`, or `Found by Model1 (security), Model2 (generic)` when dedup merged findings from several sources (personas of the same model are grouped: `Model1 (security, correctness)`). Inline comments are posted **best-effort**: one rejected comment (e.g. out-of-diff anchor) is logged and skipped, not fatal. Only if *every* comment fails does the run throw — nothing was posted, so the retry next cycle can't duplicate. The summary post is also non-fatal: once inline comments are out, a failed summary must not prevent the poller from saving review state (that would re-post everything next cycle).
 
-The PR summary comment carries: severity counts, skipped files, optional fix-prompt, and the token/cost footer aggregating every model's usage across review + dedup + gather + validation + propose.
+The PR summary comment carries: severity counts, skipped files, optional fix-prompt, and the token/cost footer aggregating every model's usage across exploration + review + dedup + gather + validation + propose.
 
 ### Robustness guarantees
 
@@ -499,6 +520,13 @@ The PR summary comment carries: severity counts, skipped files, optional fix-pro
 | One review model fails | Other models' findings are still pooled. |
 | Provider can't fetch a file | That file's findings move to a fallback diff-only group instead of a whole-file group. |
 | Dedup LLM throws / returns garbage | That file's findings stay unmerged — never dropped. |
+| PR metadata fetch fails | Logged as a warning; review proceeds without the PR title/description in `pr-context.md`. |
+| Jira down, ticket missing, or no key found | Ticket section is omitted; the review proceeds normally. |
+| Ticket comments missing, malformed, or ADF-shaped | Each comment is parsed defensively (plain string or ADF, absent author/date tolerated); unparseable ones are skipped and the rest still render. |
+| `JIRA_BASE_URL` set without `JIRA_API_TOKEN` (or vice versa) | Jira stays disabled, with a startup warning naming the missing half. |
+| Context-explorer LLM throws mid-loop | Caught, logged; reviewers get whatever was gathered before the failure (possibly nothing) — diff-only review at worst. |
+| `REVIEW_MAX_EXPLORATION_TOKENS=0` | Exploration pass disables; reviewers see the diff only, exactly as before this stage existed. |
+| Repo has no guideline files (`vegetable-police` configured) | Police runs are skipped for that PR (logged, no cost); other roles run normally. If *every* configured run is guideline-dependent, the review is skipped entirely. |
 | Info-gatherer LLM throws | Caught, logged, pipeline continues with empty context. |
 | Info-gatherer returns unparseable JSON | Caught, usage still counted, empty context. |
 | One per-file gather/dedup call hangs/throws | Others still complete (`Promise.allSettled` isolation). |
@@ -511,7 +539,7 @@ The PR summary comment carries: severity counts, skipped files, optional fix-pro
 | ALL inline comments fail to post | Run throws → state not saved → full retry next cycle (cannot duplicate, nothing was posted). Counts toward the 3-attempt cap. |
 | Summary comment fails to post | Logged, non-fatal — inline comments are already out and state gets saved. |
 | `REVIEW_MAX_INFO_TOKENS=0` | Whole info-gather pipeline disables; pure validation still runs. |
-| No `VALIDATE=true` models configured | Info-gatherer + dedup disabled; validation no-ops; pure review-only mode. |
+| No `VALIDATE=true` models configured | Context explorer + info-gatherer + dedup disabled; validation no-ops; pure review-only mode. |
 
 ### Known limits & cost bounds
 
@@ -519,7 +547,9 @@ Where the money goes, and what bounds it:
 
 | Cost driver | Bound |
 |-------------|-------|
-| Review pass | every review model × its role count pi-runs per PR (one run per model per assigned role); diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. |
+| PR intent (pr-context.md) | One provider call + at most one Jira call per PR; PR body and ticket body capped at 4 KB each, ticket discussion at 10 comments × 800 chars within a 4 KB section. |
+| Context exploration | ≤ 3 LLM calls per PR (one per round, loop usually exits earlier); gathered output ≤ `REVIEW_MAX_EXPLORATION_TOKENS` × 4 chars total, diff excerpt 16 KB per call. Shared by all reviewer runs. |
+| Review pass | every review model × its role count pi-runs per PR (one run per model per assigned role); diff over `REVIEW_MAX_DIFF_LINES` is skipped entirely. Comment context capped at 60 × 500 chars. Each run's input grows by the shared `context.md` (≤ `REVIEW_MAX_EXPLORATION_TOKENS` tokens). |
 | Same-run dedup | One LLM call per file with 2+ findings (files with one finding cost nothing). |
 | Info-gather (proactive) | One LLM call per finding-file; output ≤ `REVIEW_MAX_INFO_TOKENS` × 4 chars per call. |
 | Info-gather (follow-up) | At most one extra call per file *that filed a request*, same budget. Runs at most once per PR. |
@@ -613,9 +643,9 @@ On Bitbucket Cloud deployments, the `PROJECT/slug` repo key becomes `workspace/s
 
 ### Other data directories
 
-- `data/pi-dumps/` — last 10 AI outputs for debugging (timestamped JSONL)
-- `data/heartbeat` — written each poll cycle, used by Docker HEALTHCHECK
-- `/tmp/carrot/` — temp workspaces, wiped at start of each PR poll cycle
+- `data/pi-dumps/` — last 5 AI outputs for debugging (timestamped JSONL), capped at 200 MB total. A single reasoning trace can run to tens of megabytes, so the directory is pruned by size as well as by count; the newest dump is always kept even if it alone exceeds the budget.
+- `data/heartbeat` — liveness signal read by the Docker HEALTHCHECK. Touched before each poll cycle, each PR, and each review run: one review run calls pi through a synchronous `spawnSync` that blocks the event loop until Docker returns, so no timer can keep it fresh and the health window (1800s) has to exceed the worst-case single run (`MODELn_TIMEOUT_MS` + 30s startup + 60s per diff chunk).
+- `/tmp/carrot/<pid>/` — temp workspaces for one bot process, wiped at the start of each of its PR poll cycles. The dir is per-process on purpose: several instances (e.g. `start:server` and `start:cloud`) share `/tmp/carrot`, and wiping the whole root would delete the Docker workspace of a review another instance is running. Dirs of instances that are no longer running are reclaimed once they are older than 10 minutes.
 
 ---
 

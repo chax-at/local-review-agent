@@ -26,12 +26,16 @@ import {
   type IFixProposal,
 } from './multi-model-validator';
 import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
+import { ContextExplorer } from './context-explorer';
+import { attributionSuffix } from './finding-attribution';
+import { buildPrInfoBlob, type ITicketInfo } from './pr-context';
+import { JiraService, extractTicketKey } from '../jira/jira.service';
 import { FindingDeduplicator } from './finding-deduplicator';
 import { branchTimestamp, isBotComment } from '../constants';
 import { hasBotReviewForCommit, reviewCommitMarker } from './review-marker';
 import type { IMentionToolResult } from '../poller/mention-executor';
 import type { ReviewPersona } from './personas';
-import { PERSONA_DIRECTIVES } from './personas';
+import { PERSONA_DIRECTIVES, STANDARDS_REQUIRED_PERSONAS } from './personas';
 
 /** A model that performs the review pass via its pi-runner, with cost metadata for usage attribution. */
 export interface IReviewModel {
@@ -68,6 +72,24 @@ export function expandReviewerRuns(reviewers: IReviewModel[]): IReviewerRun[] {
     }
   }
   return runs;
+}
+
+/**
+ * Drop runs whose persona audits the repo's own guideline files when the repo
+ * has none (`hasStandards` false): a vegetable-police run without guidelines
+ * has no law book to enforce, so it must not run at all.
+ */
+export function filterRunsByStandards(
+  runs: IReviewerRun[],
+  hasStandards: boolean,
+): { active: IReviewerRun[]; skipped: IReviewerRun[] } {
+  if (hasStandards) return { active: runs, skipped: [] };
+  const active: IReviewerRun[] = [];
+  const skipped: IReviewerRun[] = [];
+  for (const run of runs) {
+    (STANDARDS_REQUIRED_PERSONAS.has(run.role) ? skipped : active).push(run);
+  }
+  return { active, skipped };
 }
 
 /**
@@ -201,6 +223,9 @@ export class ReviewerService {
   private readonly infoGatherer: InfoGatherer;
   private readonly deduplicator: FindingDeduplicator;
   private readonly maxValidators: number;
+  private readonly contextExplorer: ContextExplorer;
+  private readonly jira: JiraService;
+  private readonly heartbeat: () => void;
 
   constructor(
     provider: IGitProvider,
@@ -214,6 +239,14 @@ export class ReviewerService {
     infoGatherer: InfoGatherer,
     deduplicator: FindingDeduplicator,
     maxValidators: number,
+    contextExplorer: ContextExplorer,
+    jira: JiraService,
+    /**
+     * Liveness tick. Each pi run blocks the event loop for minutes (synchronous
+     * spawnSync), so no timer can keep the container health signal fresh — the
+     * review loop ticks between runs instead. Defaults to a no-op for tests.
+     */
+    heartbeat: () => void = () => {},
   ) {
     this.provider = provider;
     this.git = git;
@@ -226,6 +259,9 @@ export class ReviewerService {
     this.infoGatherer = infoGatherer;
     this.deduplicator = deduplicator;
     this.maxValidators = maxValidators;
+    this.contextExplorer = contextExplorer;
+    this.jira = jira;
+    this.heartbeat = heartbeat;
   }
 
   /**
@@ -326,15 +362,42 @@ export class ReviewerService {
 
     const reviewCommentContext = formatExistingCommentsForReview(existingComments);
 
-    let result: ReturnType<typeof this.runReview>;
+    // PR intent context: title + description from the provider, plus the
+    // originating Jira ticket when Jira is configured and a key is referenced
+    // in the branch, title, or description. Every step degrades to null — a
+    // missing PR fetch or Jira outage costs only the intent section.
+    const pr = await this.provider.getPullRequest(project, slug, prId).catch((err) => {
+      // Degrades to a review without PR intent — say so rather than losing the
+      // context silently.
+      LogSink.warn(
+        `PR #${prId}: fetching PR metadata failed, reviewing without intent context: ${err}`,
+        TraceTags.REVIEWER,
+      );
+      return null;
+    });
+    let ticket: ITicketInfo | null = null;
+    if (this.jira.isEnabled) {
+      const ticketKey = extractTicketKey([sourceBranch, pr?.title, pr?.description], this.jira.projectKeys);
+      if (ticketKey) {
+        ticket = await this.jira.getTicket(ticketKey);
+        LogSink.info(
+          `PR #${prId}: Jira ticket ${ticketKey} ${ticket ? 'loaded' : 'unavailable (see warning above)'}`,
+          TraceTags.JIRA,
+        );
+      }
+    }
+    const prInfo = buildPrInfoBlob(pr ? { id: prId, title: pr.title, description: pr.description } : null, ticket);
+
+    let result: Awaited<ReturnType<typeof this.runReview>>;
     try {
-      result = this.runReview(
+      result = await this.runReview(
         project,
         slug,
         prId,
         targetBranch,
         sourceBranch,
         reviewCommentContext,
+        prInfo,
         dockerImage,
         rulesFiles,
       );
@@ -403,21 +466,22 @@ export class ReviewerService {
     }
   }
 
-  private runReview(
+  private async runReview(
     project: string,
     slug: string,
     prId: number,
     targetBranch: string,
     sourceBranch: string,
     reviewCommentContext: string,
+    prInfo: string | null,
     dockerImage?: string,
     rulesFiles?: string[],
-  ): {
+  ): Promise<{
     allFindings: IAuthoredFinding[];
     reviewUsage: IModelUsage[];
     chunks: ReturnType<typeof splitDiffByFile>;
     fullDiff: string;
-  } | null {
+  } | null> {
     this.git.cloneOrFetch(project, slug);
 
     const fullDiff = this.git.getDiff(project, slug, targetBranch, sourceBranch);
@@ -460,19 +524,65 @@ export class ReviewerService {
       return null;
     }
 
-    // Every review-enabled model runs, each once per assigned role.
-    const runs = expandReviewerRuns(this.reviewModels);
+    // Decide which runs will happen BEFORE paying for exploration: a repo with
+    // only guideline-dependent roles (vegetable-police) and no guideline files
+    // reviews nothing, and exploration for a review that never runs is pure cost.
+    const { active: runs, skipped: skippedRuns } = filterRunsByStandards(
+      expandReviewerRuns(this.reviewModels),
+      standards !== null,
+    );
+    if (skippedRuns.length > 0) {
+      LogSink.info(
+        `PR #${prId}: skipping ${skippedRuns.length} run(s) (${skippedRuns
+          .map((r) => `${r.model.name}/${r.role}`)
+          .join(', ')}) — no guideline files (CLAUDE.md / AGENTS.md / rulesFiles) in repo`,
+        TraceTags.REVIEWER,
+      );
+    }
+    if (runs.length === 0) {
+      LogSink.info(`PR #${prId}: no applicable review run(s), skipping review`, TraceTags.REVIEWER);
+      return null;
+    }
     LogSink.info(
       `PR #${prId}: ${runs.length} review run(s) across ${this.reviewModels.length} model(s): ` +
         `${runs.map((r) => `${r.model.name}/${r.role}`).join(', ')}`,
       TraceTags.REVIEWER,
     );
 
+    // Exploration pass: walk the repo from the diff ONCE and share the gathered
+    // context with every reviewer run below. The PR-intent blob steers what to
+    // explore. explore() never throws — a broken exploration degrades to a
+    // diff-only review.
+    let repoContext: string | null = null;
+    let explorationUsage: IModelUsage[] = [];
+    if (this.contextExplorer.isEnabled) {
+      const exploration = await this.contextExplorer.explore(
+        diffToReview,
+        this.buildInfoTool(project, slug, sourceBranch),
+        prInfo,
+      );
+      repoContext = exploration.context || null;
+      explorationUsage = exploration.usage;
+      LogSink.info(
+        `PR #${prId}: context exploration gathered ${repoContext ? `${repoContext.length} chars` : 'nothing'}`,
+        TraceTags.REVIEWER,
+      );
+    }
+
     const allFindings: IAuthoredFinding[] = [];
     const reviewUsage: IModelUsage[] = [];
     for (const { model: rm, role } of runs) {
+      // Each run blocks the event loop for minutes — tick before every one.
+      this.heartbeat();
       try {
-        const batch = rm.pi.reviewBatch(reviewable, standards, reviewCommentContext, dockerImage, PERSONA_DIRECTIVES[role]);
+        const batch = rm.pi.reviewBatch(reviewable, {
+          codeStandards: standards,
+          existingComments: reviewCommentContext,
+          repoContext,
+          prInfo,
+          dockerImageOverride: dockerImage,
+          personaDirective: PERSONA_DIRECTIVES[role],
+        });
         for (const f of batch.findings) {
           allFindings.push({ ...f, author: rm.name, persona: role });
         }
@@ -484,16 +594,24 @@ export class ReviewerService {
 
     // Every review run errored — surface it as a failure rather than posting a
     // misleading "no issues found" summary. (A run that returns zero findings
-    // still records usage, so an empty reviewUsage means nothing produced output.)
+    // still records usage, so an empty reviewUsage means nothing produced output.
+    // Exploration usage is merged only after this check so it can't mask that.)
     if (reviewUsage.length === 0) {
+      // Exploration already cost money even though no summary will report it.
+      if (explorationUsage.length > 0) {
+        const spent = explorationUsage.reduce((sum, u) => sum + u.costEur, 0);
+        const tokens = explorationUsage.reduce((sum, u) => sum + u.inputTokens + u.outputTokens, 0);
+        LogSink.warn(
+          `PR #${prId}: exploration spent ${tokens} token(s) (${spent.toFixed(4)} EUR) before every review run failed`,
+          TraceTags.REVIEWER,
+        );
+      }
       throw new Error(`all ${runs.length} review run(s) failed`);
     }
+    reviewUsage.unshift(...explorationUsage);
 
     if (allFindings.length === 0) {
-      LogSink.info(
-        `PR #${prId}: no issues found across ${runs.length} review run(s)`,
-        TraceTags.REVIEWER,
-      );
+      LogSink.info(`PR #${prId}: no issues found across ${runs.length} review run(s)`, TraceTags.REVIEWER);
     }
 
     return { allFindings, reviewUsage, chunks, fullDiff };
@@ -784,7 +902,7 @@ export class ReviewerService {
         };
       }
 
-      input.text = `${severityPrefix}: ${finding.comment}${notesSuffix}${suggestionSuffix}`;
+      input.text = `${severityPrefix}: ${finding.comment}${attributionSuffix(finding)}${notesSuffix}${suggestionSuffix}`;
       inputs.push(input);
     }
 

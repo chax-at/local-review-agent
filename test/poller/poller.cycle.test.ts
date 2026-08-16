@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock fs so pollCycle's heartbeat write and temp-dir cleanup don't touch
+// Mock fs so pollCycle's temp-dir cleanup doesn't touch
 // the real filesystem (cleanupTempDir would wipe the live /tmp/carrot dir).
 vi.mock('fs', () => ({
   existsSync: vi.fn().mockReturnValue(false),
@@ -48,7 +48,7 @@ describe('poll cycle fetch-memo wiring', () => {
       {} as never, // router — unused with no projects
       'bot',
       1000,
-      '/tmp/heartbeat',
+      () => {},
     );
     await (poller as unknown as { pollCycle(): Promise<void> }).pollCycle();
     expect(git.resetFetchMemo).toHaveBeenCalled();
@@ -110,7 +110,7 @@ describe('poll cycle persists review state per PR (survives mid-cycle kill)', ()
       {} as never, // router
       'bot',
       1000,
-      '/tmp/heartbeat',
+      () => {},
     );
 
     await (poller as unknown as { pollCycle(): Promise<void> }).pollCycle();

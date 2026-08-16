@@ -1,6 +1,8 @@
 export interface IPullRequest {
   id: number;
   title: string;
+  /** PR body/description as authored (may contain markdown). Empty string when none. */
+  description: string;
   draft: boolean;
   isOpen: boolean;
   /** Milliseconds since epoch, or null if the provider didn't return one. */

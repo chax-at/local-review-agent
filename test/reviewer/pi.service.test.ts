@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { parsePiFindings, aggregateUsageFromPiOutput, buildLintScript, assertPiProducedResponse, buildProviderEnvArgs } from '../../src/reviewer/pi.service';
+import {
+  parsePiFindings,
+  aggregateUsageFromPiOutput,
+  buildLintScript,
+  buildBatchScript,
+  assertPiProducedResponse,
+  buildProviderEnvArgs,
+} from '../../src/reviewer/pi.service';
 
 describe('parsePiFindings', () => {
   it('should extract findings from pi JSON output', () => {
@@ -82,6 +89,24 @@ describe('buildLintScript', () => {
 
   it('produces the expected shell snippet for plain lint', () => {
     expect(buildLintScript('lint')).toBe('cd /repo && npm run lint');
+  });
+});
+
+describe('buildBatchScript', () => {
+  it('runs pi once per chunk with the attachments and separator echoes between chunks', () => {
+    const script = buildBatchScript('pi --no-tools', ' @/workspace/standards.md @/workspace/context.md', 'REVIEW', 2);
+    const lines = script.split('\n');
+    expect(lines).toContain('pi --no-tools @/workspace/chunk-0.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true');
+    expect(lines).toContain('pi --no-tools @/workspace/chunk-1.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true');
+    expect(script.split('LGR_CHUNK_SEPARATOR')).toHaveLength(2);
+    expect(script).toContain('REVIEW');
+  });
+
+  it('attaches only the chunk when there are no extra attachments', () => {
+    const script = buildBatchScript('pi --no-tools', '', 'REVIEW', 1);
+    expect(script).toContain('pi --no-tools @/workspace/chunk-0.patch "$PROMPT" || true');
+    expect(script).not.toContain('context.md');
+    expect(script).not.toContain('LGR_CHUNK_SEPARATOR');
   });
 });
 

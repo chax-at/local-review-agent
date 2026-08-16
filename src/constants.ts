@@ -4,8 +4,15 @@ import * as path from 'path';
 /** Branch prefixes created by the bot. Used to filter out bot PRs from processing. */
 export const BOT_BRANCH_PREFIXES = ['carrot/'];
 
-/** Base temp directory for all bot temp files. Cleaned at the start of each poll cycle. */
-export const BOT_TEMP_DIR = path.join(os.tmpdir(), 'carrot');
+/** Machine-wide temp root shared by every bot instance on this host. */
+export const BOT_TEMP_ROOT = path.join(os.tmpdir(), 'carrot');
+
+/**
+ * Temp directory for this process's temp files. Cleaned at the start of each
+ * poll cycle — scoped per pid so a second instance's cleanup can never delete
+ * the Docker workspace of a review this instance is running.
+ */
+export const BOT_TEMP_DIR = path.join(BOT_TEMP_ROOT, String(process.pid));
 
 /** Check if a comment is from the bot by author slug */
 export const isBotComment = (authorSlug: string, botUsername: string): boolean => authorSlug === botUsername;

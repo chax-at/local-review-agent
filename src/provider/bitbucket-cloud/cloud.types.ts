@@ -19,6 +19,8 @@ export interface ICloudUser {
 export interface ICloudPullRequest {
   id: number;
   title: string;
+  description?: string;
+  summary?: { raw?: string };
   state: 'OPEN' | 'MERGED' | 'DECLINED' | 'SUPERSEDED';
   draft?: boolean;
   created_on: string;

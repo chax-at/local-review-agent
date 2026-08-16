@@ -12,6 +12,7 @@ export function toPullRequestCloud(wire: ICloudPullRequest): IPullRequest {
   return {
     id: wire.id,
     title: wire.title,
+    description: wire.description ?? wire.summary?.raw ?? '',
     draft: wire.draft ?? false,
     isOpen: wire.state === 'OPEN',
     createdAt: Number.isNaN(createdAt) ? null : createdAt,

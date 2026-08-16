@@ -25,7 +25,10 @@ export type IFixProposal =
   | { action: 'replace'; findingIndex: number; replacement: string; startLine: number; endLine: number }
   | { action: 'skip'; findingIndex: number; reason: string };
 
-export interface IValidatedFinding extends IReviewFinding {
+// Extends IAuthoredFinding (not just IReviewFinding): every validated finding
+// is built by spreading the incoming authored finding, so author/persona/
+// sources flow through to the posted comment's attribution line.
+export interface IValidatedFinding extends IAuthoredFinding {
   validationNotes: string;
 }
 
@@ -402,7 +405,12 @@ export class MultiModelValidator {
     const systemPrompt = [
       'You are a senior code reviewer validating automated findings.',
       'For EACH finding, decide if it is genuinely worth flagging.',
-      'A finding is only worth posting if it is a real issue — be strict.',
+      'A finding is worth posting if it is a real issue — be strict about noise, but do not',
+      'dismiss findings that point out genuinely misleading or factually wrong information',
+      'when the finding also provides a concrete fix (e.g. replacement text or clear action).',
+      'Stale TODOs, comments that contradict the actual code, and misleading documentation',
+      'ARE real issues when a fix is included — they waste future readers\u2019 time and cause',
+      'incorrect assumptions. Without a suggested fix, they are just observation noise.',
       'Add a brief thought (1 sentence) explaining WHY it matters or why it is noise.',
       '',
       'You may also request ADDITIONAL CONTEXT via the `infoRequest` field. If the',
@@ -528,7 +536,10 @@ export class MultiModelValidator {
       'You are reconsidering code review findings where reviewers disagreed.',
       'Other reviewers saw the same finding and reached different conclusions — read their reasoning.',
       'Read their reasoning carefully, then make your final decision.',
-      'A finding is only worth posting if it is a REAL issue that the developer should fix.',
+      'A finding is worth posting if it is a REAL issue that the developer should act on.',
+      'Do not dismiss findings just because the fix is small — misleading comments, stale TODOs',
+      'that contradict actual code, and factually wrong documentation ARE real issues, but only',
+      'when the finding includes a concrete suggested fix. Without one, treat them as noise.',
       'Return JSON: { "results": [{ "index": 0, "relevant": true/false, "thought": "..." }, ...] }',
     ].join('\n');
 

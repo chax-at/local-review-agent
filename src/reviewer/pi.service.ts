@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import LogSink from '@chax-at/log-sink';
@@ -25,6 +25,141 @@ const SEVERITY_MAP: Record<string, IReviewFinding['severity']> = {
 
 function normalizeSeverity(severity: string): IReviewFinding['severity'] {
   return SEVERITY_MAP[severity.toLowerCase()] ?? 'note';
+}
+
+/**
+ * Largest pi log read into a string. V8 caps strings at ~512 MB, so a whole-file
+ * read of a very long model trace throws ERR_STRING_TOO_LONG and loses the run.
+ * Above this cap only the tail is parsed — findings live in the trailing
+ * message_end events, so a truncated tail still beats a failed review.
+ */
+export const MAX_PI_OUTPUT_BYTES = 256 * 1024 * 1024;
+
+/** How many debug dumps of pi output to keep in data/pi-dumps. */
+export const MAX_PI_DUMPS = 5;
+
+/**
+ * Byte budget for the whole dump directory. A single reasoning trace can run to
+ * tens of megabytes (cumulative message_update events), so a count-only
+ * retention policy silently turns into gigabytes on disk.
+ */
+export const MAX_PI_DUMP_DIR_BYTES = 200 * 1024 * 1024;
+
+/**
+ * Enforce the dump retention policy: keep at most `maxFiles`, then drop the
+ * oldest until the directory fits `maxTotalBytes`. Dumps are named by ISO
+ * timestamp, so lexical order is chronological. The newest dump is always kept,
+ * even if it alone exceeds the budget — it is the one being debugged.
+ *
+ * Best-effort: every filesystem error is swallowed, since failing to prune must
+ * never fail a review.
+ */
+export function pruneDumpDir(dumpDir: string, maxFiles: number, maxTotalBytes: number): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dumpDir).sort();
+  } catch {
+    return;
+  }
+
+  const drop = (name: string): void => {
+    try {
+      fs.unlinkSync(path.join(dumpDir, name));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  for (const old of entries.slice(0, -maxFiles)) drop(old);
+
+  const kept = entries.slice(-maxFiles);
+  const sized = kept.map((name) => {
+    let size = 0;
+    try {
+      size = fs.statSync(path.join(dumpDir, name)).size;
+    } catch {
+      size = 0;
+    }
+    return { name, size };
+  });
+
+  let total = sized.reduce((sum, f) => sum + f.size, 0);
+  // Oldest first, never the last one standing.
+  for (const file of sized.slice(0, -1)) {
+    if (total <= maxTotalBytes) break;
+    drop(file.name);
+    total -= file.size;
+  }
+}
+
+/**
+ * Create a run directory under this instance's temp dir. The temp dir is
+ * per-process and recreated each poll cycle, so make sure it exists rather than
+ * relying on the cycle having run first.
+ */
+function makeRunDir(prefix: string): string {
+  fs.mkdirSync(BOT_TEMP_DIR, { recursive: true });
+  return fs.mkdtempSync(path.join(BOT_TEMP_DIR, prefix));
+}
+
+/**
+ * Read the container's log file, falling back to its last {@link MAX_PI_OUTPUT_BYTES}
+ * bytes when the file is too big to hold in a single string. Read errors
+ * (including ENOENT) propagate so callers can retry.
+ */
+export function readPiOutput(file: string, maxBytes: number = MAX_PI_OUTPUT_BYTES): string {
+  const size = fs.statSync(file).size;
+  if (size <= maxBytes) return fs.readFileSync(file, 'utf-8');
+
+  LogSink.warn(`pi output is ${size} bytes; parsing only the last ${maxBytes} bytes`, TraceTags.PI);
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    fs.readSync(fd, buf, 0, maxBytes, size - maxBytes);
+    const text = buf.toString('utf-8');
+    // Drop the leading partial line — every parser downstream splits on newlines.
+    const firstNewline = text.indexOf('\n');
+    return firstNewline === -1 ? text : text.slice(firstNewline + 1);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Explain why the container's log could not be read. The read failing is not
+ * proof that pi wrote nothing: the workspace may have been deleted mid-run, or
+ * the file may be present but too large to load.
+ */
+export function describeOutputReadFailure(
+  err: NodeJS.ErrnoException | null,
+  workspaceHost: string,
+  outHost: string,
+): string {
+  const code = err?.code ?? 'unknown';
+  const message = err?.message ?? 'no error captured';
+
+  if (!fs.existsSync(workspaceHost)) {
+    return `workspace directory ${workspaceHost} no longer exists — it was removed while the container was running (${code}); the container wrote to an unlinked file`;
+  }
+
+  let size: number | null = null;
+  try {
+    size = fs.statSync(outHost).size;
+  } catch {
+    size = null;
+  }
+
+  if (size === null) {
+    let siblings = '(unreadable)';
+    try {
+      siblings = fs.readdirSync(workspaceHost).join(', ') || '(empty)';
+    } catch {
+      /* keep placeholder */
+    }
+    return `${outHost} was never created (${code}); workspace still holds: ${siblings}`;
+  }
+
+  return `${outHost} exists (${size} bytes) but could not be read: ${code}: ${message}`;
 }
 
 export function parsePiFindings(output: string): IReviewFinding[] {
@@ -157,6 +292,25 @@ export function buildLintScript(script: string): string {
   return `cd /repo && npm run ${script}`;
 }
 
+/**
+ * Build the in-container shell script that runs pi once per diff chunk, with
+ * `attachmentArgs` (already-joined ` @/workspace/...` file references) appended
+ * to every invocation and a separator echoed between chunks.
+ *
+ * Pure function — exported separately from `reviewBatch` so the attachment
+ * wiring can be unit-tested without spawning Docker.
+ */
+export function buildBatchScript(piBase: string, attachmentArgs: string, prompt: string, chunkCount: number): string {
+  const lines = ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')'];
+
+  for (let i = 0; i < chunkCount; i++) {
+    if (i > 0) lines.push(`echo "${CHUNK_SEPARATOR}"`);
+    lines.push(`${piBase} @/workspace/chunk-${i}.patch${attachmentArgs} "$PROMPT" || true`);
+  }
+
+  return lines.join('\n');
+}
+
 function pickNum(obj: Record<string, unknown>, keys: string[]): number | null {
   for (const k of keys) {
     const v = obj[k];
@@ -243,6 +397,18 @@ export interface IPiReviewResult {
   usage: IPiTokenUsage;
 }
 
+/** Optional context and overrides for a review batch — see reviewBatch. */
+export interface IReviewBatchOptions {
+  codeStandards?: string | null;
+  existingComments?: string | null;
+  /** Pre-review exploration output, attached as context.md. */
+  repoContext?: string | null;
+  /** PR title/description + Jira ticket blob, attached as pr-context.md. */
+  prInfo?: string | null;
+  dockerImageOverride?: string;
+  personaDirective?: string;
+}
+
 function extractFindings(output: string): IReviewFinding[] {
   const lines = output.trim().split('\n');
   LogSink.debug(`pi output: ${lines.length} lines`, TraceTags.PI);
@@ -292,12 +458,7 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
  * other provider uses pi's built-in base, so `apiBase` is intentionally
  * ignored for them (the `--model` CLI flag carries the model id).
  */
-export function buildProviderEnvArgs(
-  provider: string,
-  apiKey: string,
-  apiBase: string,
-  model: string,
-): string[] {
+export function buildProviderEnvArgs(provider: string, apiKey: string, apiBase: string, model: string): string[] {
   if (!apiKey) return [];
   const keyEnv = PROVIDER_API_KEY_ENV[provider] ?? 'AZURE_OPENAI_API_KEY';
   const args = ['-e', `${keyEnv}=${apiKey}`];
@@ -333,49 +494,58 @@ export class PiService {
   }
 
   public review(diffContent: string, codeStandards: string | null, dockerImageOverride?: string): IPiReviewResult {
-    return this.reviewBatch([diffContent], codeStandards, null, dockerImageOverride);
+    return this.reviewBatch([diffContent], { codeStandards, dockerImageOverride });
   }
 
   /**
    * Review multiple diff chunks in a single Docker container.
    * Installs pi once, then loops over all chunks inside the container.
+   *
+   * Optional context attachments (each skipped when empty):
+   *  - `codeStandards`    → standards.md         (repo guideline files)
+   *  - `prInfo`           → pr-context.md        (PR title/description + Jira ticket)
+   *  - `repoContext`      → context.md           (pre-review exploration output)
+   *  - `existingComments` → existing-comments.md (already-posted PR comments)
    */
-  public reviewBatch(
-    diffs: string[],
-    codeStandards: string | null,
-    existingComments: string | null,
-    dockerImageOverride?: string,
-    personaDirective: string = PERSONA_DIRECTIVES.generic,
-  ): IPiReviewResult {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-'));
+  public reviewBatch(diffs: string[], opts: IReviewBatchOptions = {}): IPiReviewResult {
+    const tmpDir = makeRunDir('pi-');
     try {
       for (let i = 0; i < diffs.length; i++) {
         fs.writeFileSync(path.join(tmpDir, `chunk-${i}.patch`), diffs[i]);
       }
 
-      let standardsArg = '';
-      if (codeStandards) {
-        fs.writeFileSync(path.join(tmpDir, 'standards.md'), codeStandards);
-        standardsArg = ' @/workspace/standards.md';
-      }
+      const attachment = (name: string, content: string | null | undefined): string => {
+        if (!content || !content.trim()) return '';
+        fs.writeFileSync(path.join(tmpDir, name), content);
+        return ` @/workspace/${name}`;
+      };
 
-      let commentsArg = '';
-      if (existingComments && existingComments.trim()) {
-        fs.writeFileSync(path.join(tmpDir, 'existing-comments.md'), existingComments);
-        commentsArg = ' @/workspace/existing-comments.md';
-      }
+      const standardsArg = attachment('standards.md', opts.codeStandards);
+      const prInfoArg = attachment('pr-context.md', opts.prInfo);
+      const contextArg = attachment('context.md', opts.repoContext);
+      const commentsArg = attachment('existing-comments.md', opts.existingComments);
 
-      const prompt = buildReviewPrompt(personaDirective, Boolean(commentsArg));
+      const prompt = buildReviewPrompt(
+        opts.personaDirective ?? PERSONA_DIRECTIVES.generic,
+        Boolean(commentsArg),
+        Boolean(contextArg),
+        Boolean(prInfoArg),
+      );
 
       const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --no-tools`;
-      const script = this.buildBatchScript(piBase, standardsArg, commentsArg, prompt, diffs.length);
+      const script = buildBatchScript(
+        piBase,
+        `${standardsArg}${prInfoArg}${contextArg}${commentsArg}`,
+        prompt,
+        diffs.length,
+      );
       fs.writeFileSync(path.join(tmpDir, 'run.sh'), script);
 
       LogSink.info(`Invoking pi for review (Docker, ${diffs.length} chunk(s))...`, TraceTags.PI);
       const timeout = this.timeoutMs + DOCKER_INSTALL_BUFFER_MS + diffs.length * PER_CHUNK_TIMEOUT_MS;
       const output = this.dockerRun({
         mounts: [{ host: tmpDir, container: '/workspace' }],
-        imageOverride: dockerImageOverride,
+        imageOverride: opts.dockerImageOverride,
         timeout,
       });
 
@@ -414,7 +584,7 @@ export class PiService {
     lintScript: string,
     dockerImageOverride?: string,
   ): { failed: boolean; output: string } {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-lint-'));
+    const tmpDir = makeRunDir('pi-lint-');
     try {
       const cmd = buildLintScript(lintScript);
       // No `set -e`: the script's exit code is npm's exit code. Stderr is
@@ -441,7 +611,7 @@ export class PiService {
       let output = '';
       if (failed) {
         try {
-          output = fs.readFileSync(path.join(tmpDir, 'lgr-pi-out.log'), 'utf-8').slice(0, 5000);
+          output = readPiOutput(path.join(tmpDir, 'lgr-pi-out.log')).slice(0, 5000);
         } catch {
           output = '(lint output unavailable)';
         }
@@ -459,7 +629,7 @@ export class PiService {
     userMessage: string,
     dockerImageOverride?: string,
   ): { summary: string | null; usage: IPiTokenUsage } {
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'pi-fix-'));
+    const tmpDir = makeRunDir('pi-fix-');
     try {
       fs.writeFileSync(path.join(tmpDir, 'diff.patch'), diffContent);
 
@@ -508,23 +678,6 @@ export class PiService {
     return ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')', `${piCmd} "$PROMPT"`].join(
       '\n',
     );
-  }
-
-  private buildBatchScript(
-    piBase: string,
-    standardsArg: string,
-    commentsArg: string,
-    prompt: string,
-    chunkCount: number,
-  ): string {
-    const lines = ['#!/bin/sh', 'set -e', "PROMPT=$(cat <<'PROMPT_EOF'", prompt, 'PROMPT_EOF', ')'];
-
-    for (let i = 0; i < chunkCount; i++) {
-      if (i > 0) lines.push(`echo "${CHUNK_SEPARATOR}"`);
-      lines.push(`${piBase} @/workspace/chunk-${i}.patch${standardsArg}${commentsArg} "$PROMPT" || true`);
-    }
-
-    return lines.join('\n');
   }
 
   private dockerRun(opts: {
@@ -586,27 +739,32 @@ export class PiService {
 
     const timeout = opts.timeout ?? this.timeoutMs + DOCKER_INSTALL_BUFFER_MS;
 
-    // Capture docker's own stdout/stderr + exit so a failure isn't reduced to a
-    // bare ENOENT below. With the in-container redirect, docker's stdout is
-    // normally empty; daemon-level errors (image pull, mount failure, non-zero
-    // exit, timeout kill) land on stderr/the thrown error.
-    let dockerStdout = '';
-    let dockerStderr = '';
-    try {
-      dockerStdout = execFileSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' }) ?? '';
-    } catch (err: any) {
-      dockerStdout = typeof err?.stdout === 'string' ? err.stdout : '';
-      dockerStderr = typeof err?.stderr === 'string' ? err.stderr : '';
+    // spawnSync (not execFileSync) so docker's stderr is captured on success too:
+    // it is the only place daemon-level warnings show up, and the previous error
+    // log printed "(empty)" for it whether or not anything had been written.
+    // With the in-container redirect, docker's stdout is normally empty.
+    const spawned = spawnSync('docker', args, { timeout, maxBuffer: 1024 * 1024, encoding: 'utf-8' });
+    const dockerStdout = spawned.stdout ?? '';
+    const dockerStderr = spawned.stderr ?? '';
+    if (spawned.error || spawned.status !== 0) {
+      const killed = Boolean(spawned.error) && spawned.signal !== null;
       appendDockerErrorLog({
         context: `docker run failed (model=${this.model}, provider=${this.provider}, image=${image})`,
         command: `docker ${logArgs.join(' ')}`,
-        exitStatus: typeof err?.status === 'number' ? err.status : null,
-        signal: err?.signal ?? null,
+        exitStatus: spawned.status,
+        signal: spawned.signal,
         stdout: dockerStdout,
         stderr: dockerStderr,
-        detail: err?.killed ? `process killed (timeout ${timeout}ms or signal)` : String(err?.message ?? err),
+        detail: killed
+          ? `process killed (timeout ${timeout}ms or signal)`
+          : String(spawned.error?.message ?? `docker exited with status ${spawned.status}`),
       });
-      throw err;
+      throw (
+        spawned.error ??
+        new Error(
+          `docker run exited with status ${spawned.status}: ${dockerStderr.trim().slice(0, 300) || '(no stderr)'}`,
+        )
+      );
     }
 
     // The container writes the redirect file onto a bind mount; under some Docker
@@ -614,26 +772,31 @@ export class PiService {
     // Retry the read briefly before treating a missing file as a real failure.
     const READ_ATTEMPTS = 4;
     let output: string | null = null;
+    let readErr: NodeJS.ErrnoException | null = null;
     for (let attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
       try {
-        output = fs.readFileSync(outHost, 'utf-8');
+        output = readPiOutput(outHost);
         break;
-      } catch {
+      } catch (err) {
+        readErr = err as NodeJS.ErrnoException;
         sleepSync(250);
       }
     }
 
     if (output === null) {
+      // Never claim the file was "not produced" — the read can also fail because
+      // the workspace was deleted mid-run or the log outgrew V8's string cap.
+      const cause = describeOutputReadFailure(readErr, workspaceHost, outHost);
       appendDockerErrorLog({
-        context: `docker exited cleanly but ${outLogName} was never produced (model=${this.model}, provider=${this.provider}, image=${image})`,
+        context: `docker exited cleanly but ${outLogName} could not be read (model=${this.model}, provider=${this.provider}, image=${image})`,
         command: `docker ${logArgs.join(' ')}`,
-        exitStatus: 0,
-        signal: null,
+        exitStatus: spawned.status,
+        signal: spawned.signal,
         stdout: dockerStdout,
         stderr: dockerStderr,
-        detail: `output file still missing on host after ${READ_ATTEMPTS} read attempts: ${outHost}`,
+        detail: `after ${READ_ATTEMPTS} read attempts: ${cause}`,
       });
-      throw new Error(`pi produced no output file (${outLogName}) despite a clean docker exit; see data/error.log`);
+      throw new Error(`pi output unreadable after a clean docker exit: ${cause}; see data/error.log`);
     }
 
     // Dump last pi output to data/ for debugging (best-effort)
@@ -642,15 +805,7 @@ export class PiService {
       if (!fs.existsSync(dumpDir)) fs.mkdirSync(dumpDir, { recursive: true });
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       fs.writeFileSync(path.join(dumpDir, `${ts}.jsonl`), output);
-      // Keep only the last 10 dumps
-      const files = fs.readdirSync(dumpDir).sort();
-      for (const old of files.slice(0, -10)) {
-        try {
-          fs.unlinkSync(path.join(dumpDir, old));
-        } catch {
-          /* ignore */
-        }
-      }
+      pruneDumpDir(dumpDir, MAX_PI_DUMPS, MAX_PI_DUMP_DIR_BYTES);
     } catch {
       /* ignore dump failure */
     }

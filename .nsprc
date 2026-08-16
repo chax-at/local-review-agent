@@ -1,8 +1,4 @@
 {
-  "1115806": {
-    "active": true,
-    "notes": "no untrusted _.template input"
-  },
   "1113465": {
     "active": true,
     "notes": "Dev-only"
@@ -14,9 +10,5 @@
   "1113552": {
     "active": true,
     "notes": "Dev-only"
-  },
-  "1115552": {
-    "active": true,
-    "notes": "no attacker-controlled glob input"
   }
 }
