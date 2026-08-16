@@ -602,11 +602,11 @@ export class ReviewerService {
           TraceTags.REVIEWER,
         );
       }
-      scannerFindings = await this.securityScanner.scan(this.git.getRepoDir(project, slug), targetBranch, sourceBranch);
-      LogSink.info(
-        `PR #${prId}: security scan ${scannerFindings ? 'found findings' : 'found nothing'}`,
-        TraceTags.REVIEWER,
-      );
+      const outcome = await this.securityScanner.scan(this.git.getRepoDir(project, slug), targetBranch, sourceBranch);
+      scannerFindings = outcome.findings;
+      // Per-tool status, not just found/not-found: both tools degrade silently
+      // on failure, so a crash must not read as a clean scan.
+      LogSink.info(`PR #${prId}: security scan — ${outcome.status || 'disabled'}`, TraceTags.REVIEWER);
     }
 
     const allFindings: IAuthoredFinding[] = [];
