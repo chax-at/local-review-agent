@@ -18,7 +18,8 @@
     "MaxFileLines": 1000,
     "MaxInfoTokens": 8000,
     "MaxExplorationTokens": 50000,
-    "MaxValidators": 2
+    "MaxValidators": 2,
+    "SecurityScannersEnabled": false
   },
   "Model1": {
     "Name": "Model1",
