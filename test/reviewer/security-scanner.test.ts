@@ -158,4 +158,11 @@ describe('SecurityScanner', () => {
     const scanner = new SecurityScanner(false);
     await expect(scanner.scan('/repos/acme/app', 'main', 'feature')).resolves.toBe('');
   });
+
+  it('never throws even when binaries are missing', async () => {
+    const scanner = new SecurityScanner(true);
+    // semgrep and gitleaks are not installed in test environment, so this
+    // exercises the "missing binary" path and verifies the never-throws contract
+    await expect(scanner.scan('/repos/acme/app', 'main', 'feature')).resolves.toBeDefined();
+  });
 });

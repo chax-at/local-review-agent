@@ -190,8 +190,15 @@ export class SecurityScanner {
   }
 
   private runGitleaks(repoDir: string, targetBranch: string, sourceBranch: string): IScanFinding[] {
-    fs.mkdirSync(BOT_TEMP_DIR, { recursive: true });
-    const tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'scan-'));
+    let tmpDir: string;
+    try {
+      fs.mkdirSync(BOT_TEMP_DIR, { recursive: true });
+      tmpDir = fs.mkdtempSync(path.join(BOT_TEMP_DIR, 'scan-'));
+    } catch (err) {
+      LogSink.warn(`Security scan: gitleaks temp dir failed: ${err}`, TraceTags.REVIEWER);
+      return [];
+    }
+
     const reportPath = path.join(tmpDir, 'gitleaks.json');
     try {
       try {
@@ -211,6 +218,9 @@ export class SecurityScanner {
       }
       if (!fs.existsSync(reportPath)) return [];
       return parseGitleaksOutput(fs.readFileSync(reportPath, 'utf-8'));
+    } catch (err) {
+      LogSink.warn(`Security scan: gitleaks read output failed: ${err}`, TraceTags.REVIEWER);
+      return [];
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
