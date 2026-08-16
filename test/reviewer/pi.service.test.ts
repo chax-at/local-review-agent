@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   parsePiFindings,
   aggregateUsageFromPiOutput,
@@ -6,6 +9,7 @@ import {
   buildBatchScript,
   assertPiProducedResponse,
   buildProviderEnvArgs,
+  writeAttachment,
 } from '../../src/reviewer/pi.service';
 
 describe('parsePiFindings', () => {
@@ -96,8 +100,12 @@ describe('buildBatchScript', () => {
   it('runs pi once per chunk with the attachments and separator echoes between chunks', () => {
     const script = buildBatchScript('pi --no-tools', ' @/workspace/standards.md @/workspace/context.md', 'REVIEW', 2);
     const lines = script.split('\n');
-    expect(lines).toContain('pi --no-tools @/workspace/chunk-0.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true');
-    expect(lines).toContain('pi --no-tools @/workspace/chunk-1.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true');
+    expect(lines).toContain(
+      'pi --no-tools @/workspace/chunk-0.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true',
+    );
+    expect(lines).toContain(
+      'pi --no-tools @/workspace/chunk-1.patch @/workspace/standards.md @/workspace/context.md "$PROMPT" || true',
+    );
     expect(script.split('LGR_CHUNK_SEPARATOR')).toHaveLength(2);
     expect(script).toContain('REVIEW');
   });
@@ -184,14 +192,20 @@ describe('buildProviderEnvArgs', () => {
   });
 
   it('passes the Gemini key under GEMINI_API_KEY and no base (built-in)', () => {
-    expect(buildProviderEnvArgs('google', 'g-key', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-3.1-pro')).toEqual([
-      '-e',
-      'GEMINI_API_KEY=g-key',
-    ]);
+    expect(
+      buildProviderEnvArgs(
+        'google',
+        'g-key',
+        'https://generativelanguage.googleapis.com/v1beta/openai',
+        'gemini-3.1-pro',
+      ),
+    ).toEqual(['-e', 'GEMINI_API_KEY=g-key']);
   });
 
   it('keeps Azure key, base URL, and model env vars for azure-openai-responses', () => {
-    expect(buildProviderEnvArgs('azure-openai-responses', 'az-key', 'https://x.openai.azure.com/openai/v1', 'gpt-5.5-1')).toEqual([
+    expect(
+      buildProviderEnvArgs('azure-openai-responses', 'az-key', 'https://x.openai.azure.com/openai/v1', 'gpt-5.5-1'),
+    ).toEqual([
       '-e',
       'AZURE_OPENAI_API_KEY=az-key',
       '-e',
@@ -206,3 +220,35 @@ describe('buildProviderEnvArgs', () => {
   });
 });
 
+describe('writeAttachment', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-attach-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('writes scanner findings and returns the @/workspace reference', () => {
+    const content = '## Semgrep (static analysis)\n- `src/foo.ts:12` [eval-detected] (WARNING): Detected eval';
+    expect(writeAttachment(tmpDir, 'scanner-findings.md', content)).toBe(' @/workspace/scanner-findings.md');
+    expect(fs.readFileSync(path.join(tmpDir, 'scanner-findings.md'), 'utf-8')).toBe(content);
+  });
+
+  it('writes any other named attachment the same way', () => {
+    expect(writeAttachment(tmpDir, 'pr-context.md', 'title')).toBe(' @/workspace/pr-context.md');
+    expect(fs.existsSync(path.join(tmpDir, 'pr-context.md'))).toBe(true);
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['empty', ''],
+    ['whitespace-only', '   \n\t '],
+  ])('returns no reference and writes no file for %s content', (_label, content) => {
+    expect(writeAttachment(tmpDir, 'scanner-findings.md', content)).toBe('');
+    expect(fs.existsSync(path.join(tmpDir, 'scanner-findings.md'))).toBe(false);
+  });
+});

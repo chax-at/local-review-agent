@@ -397,6 +397,17 @@ export interface IPiReviewResult {
   usage: IPiTokenUsage;
 }
 
+/**
+ * Writes one optional context file into the run directory and returns the
+ * ` @/workspace/<name>` reference to append to pi's argv. Empty or whitespace-only
+ * content writes nothing and contributes no reference.
+ */
+export function writeAttachment(tmpDir: string, name: string, content: string | null | undefined): string {
+  if (!content || !content.trim()) return '';
+  fs.writeFileSync(path.join(tmpDir, name), content);
+  return ` @/workspace/${name}`;
+}
+
 /** Optional context and overrides for a review batch — see reviewBatch. */
 export interface IReviewBatchOptions {
   codeStandards?: string | null;
@@ -517,17 +528,11 @@ export class PiService {
         fs.writeFileSync(path.join(tmpDir, `chunk-${i}.patch`), diffs[i]);
       }
 
-      const attachment = (name: string, content: string | null | undefined): string => {
-        if (!content || !content.trim()) return '';
-        fs.writeFileSync(path.join(tmpDir, name), content);
-        return ` @/workspace/${name}`;
-      };
-
-      const standardsArg = attachment('standards.md', opts.codeStandards);
-      const prInfoArg = attachment('pr-context.md', opts.prInfo);
-      const contextArg = attachment('context.md', opts.repoContext);
-      const scannerArg = attachment('scanner-findings.md', opts.scannerFindings);
-      const commentsArg = attachment('existing-comments.md', opts.existingComments);
+      const standardsArg = writeAttachment(tmpDir, 'standards.md', opts.codeStandards);
+      const prInfoArg = writeAttachment(tmpDir, 'pr-context.md', opts.prInfo);
+      const contextArg = writeAttachment(tmpDir, 'context.md', opts.repoContext);
+      const scannerArg = writeAttachment(tmpDir, 'scanner-findings.md', opts.scannerFindings);
+      const commentsArg = writeAttachment(tmpDir, 'existing-comments.md', opts.existingComments);
 
       const prompt = buildReviewPrompt(
         opts.personaDirective ?? PERSONA_DIRECTIVES.generic,
