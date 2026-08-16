@@ -94,6 +94,17 @@ describe('buildReviewPrompt', () => {
     expect(prompt).not.toContain('pr-context.md');
   });
 
+  it('appends the scanner-findings.md line when scanner output is attached', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.security, false, false, false, true);
+    expect(prompt).toContain('scanner-findings.md');
+    expect(prompt).toContain('cross-check');
+  });
+
+  it('omits the scanner-findings.md line when there is no scanner output', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.security, false, false, false, false);
+    expect(prompt).not.toContain('scanner-findings.md');
+  });
+
   it('vegetable-police directive grounds the review in standards.md and demands rule citations', () => {
     const directive = PERSONA_DIRECTIVES['vegetable-police'];
     expect(directive).toContain('standards.md');
