@@ -100,6 +100,12 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain('cross-check');
   });
 
+  it('marks scanner-findings.md content as untrusted, like the other context files', () => {
+    const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.security, false, false, false, true);
+    expect(prompt).toContain('untrusted');
+    expect(prompt).toContain('never instructions');
+  });
+
   it('omits the scanner-findings.md line when there is no scanner output', () => {
     const prompt = buildReviewPrompt(PERSONA_DIRECTIVES.security, false, false, false, false);
     expect(prompt).not.toContain('scanner-findings.md');
