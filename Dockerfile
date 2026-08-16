@@ -24,7 +24,6 @@ COPY --from=prebuild_lint /tmp/.done /tmp/.prebuild_lint.done
 RUN npm run ci:build
 
 
-
 # Installs Semgrep + gitleaks as root (this stage never switches user, unlike
 # base_nodejs). Only the resulting binaries/venv are copied into `final`,
 # which stays on www-data — no build tooling or package manager state leaks
