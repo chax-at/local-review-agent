@@ -14,6 +14,7 @@ import { LlmClient, type ILlmConfig } from './reviewer/llm-client';
 import { MultiModelValidator } from './reviewer/multi-model-validator';
 import { InfoGatherer } from './reviewer/info-gatherer';
 import { ContextExplorer } from './reviewer/context-explorer';
+import { SecurityScanner } from './reviewer/security-scanner';
 import { JiraService } from './jira/jira.service';
 import { createHeartbeat } from './heartbeat';
 import { FindingDeduplicator } from './reviewer/finding-deduplicator';
@@ -143,6 +144,10 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     LogSink.debug(`Context explorer: disabled (no validator or MaxExplorationTokens=0)`, TraceTags.DEBUG);
   }
 
+  const securityScannersEnabled = config.get('Review.SecurityScannersEnabled');
+  const securityScanner = new SecurityScanner(securityScannersEnabled);
+  LogSink.debug(`Security scanner: ${securityScanner.isEnabled ? 'enabled' : 'disabled'}`, TraceTags.DEBUG);
+
   // Finding deduplicator: a single LLM (the first validator) collapses same-run
   // duplicate findings before the validation council sees them.
   const deduplicator = new FindingDeduplicator(validators[0] ?? null);
@@ -218,6 +223,7 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     deduplicator,
     maxValidators,
     contextExplorer,
+    securityScanner,
     jiraService,
     heartbeat,
   );

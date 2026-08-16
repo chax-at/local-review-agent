@@ -27,6 +27,7 @@ import {
 } from './multi-model-validator';
 import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
 import { ContextExplorer } from './context-explorer';
+import { SecurityScanner } from './security-scanner';
 import { attributionSuffix } from './finding-attribution';
 import { buildPrInfoBlob, type ITicketInfo } from './pr-context';
 import { JiraService, extractTicketKey } from '../jira/jira.service';
@@ -90,6 +91,19 @@ export function filterRunsByStandards(
     (STANDARDS_REQUIRED_PERSONAS.has(run.role) ? skipped : active).push(run);
   }
   return { active, skipped };
+}
+
+/**
+ * Personas that get static-scanner output (Semgrep/gitleaks) attached as
+ * context. `security` diagnoses it directly; `generic` covers security among
+ * its broader focus. Every other persona is told to ignore security entirely,
+ * so scanner output would just be noise for them.
+ */
+export const SCANNER_ELIGIBLE_PERSONAS: ReadonlySet<ReviewPersona> = new Set(['security', 'generic']);
+
+/** Scanner findings are only attached for personas that judge security — see `SCANNER_ELIGIBLE_PERSONAS`. */
+export function scannerFindingsForRole(role: ReviewPersona, scannerFindings: string): string | null {
+  return scannerFindings.trim() && SCANNER_ELIGIBLE_PERSONAS.has(role) ? scannerFindings : null;
 }
 
 /**
@@ -224,6 +238,7 @@ export class ReviewerService {
   private readonly deduplicator: FindingDeduplicator;
   private readonly maxValidators: number;
   private readonly contextExplorer: ContextExplorer;
+  private readonly securityScanner: SecurityScanner;
   private readonly jira: JiraService;
   private readonly heartbeat: () => void;
 
@@ -240,6 +255,7 @@ export class ReviewerService {
     deduplicator: FindingDeduplicator,
     maxValidators: number,
     contextExplorer: ContextExplorer,
+    securityScanner: SecurityScanner,
     jira: JiraService,
     /**
      * Liveness tick. Each pi run blocks the event loop for minutes (synchronous
@@ -260,6 +276,7 @@ export class ReviewerService {
     this.deduplicator = deduplicator;
     this.maxValidators = maxValidators;
     this.contextExplorer = contextExplorer;
+    this.securityScanner = securityScanner;
     this.jira = jira;
     this.heartbeat = heartbeat;
   }
@@ -569,6 +586,29 @@ export class ReviewerService {
       );
     }
 
+    // Security scan pass: Semgrep (SAST) + gitleaks (secrets), scoped to only
+    // this PR's changes, shared with every security-relevant persona run
+    // below. Only worth paying for when at least one such run will happen.
+    let scannerFindings = '';
+    if (this.securityScanner.isEnabled && runs.some((r) => SCANNER_ELIGIBLE_PERSONAS.has(r.role))) {
+      // Semgrep scans the working tree, not git objects — reset to this PR's
+      // source tip first (gitleaks reads history directly and doesn't need
+      // this, but resetting once for both is simpler and harmless).
+      try {
+        this.git.resetToRemoteBranch(project, slug, sourceBranch);
+      } catch (err) {
+        LogSink.warn(
+          `PR #${prId}: could not reset to ${sourceBranch} before security scan: ${err}`,
+          TraceTags.REVIEWER,
+        );
+      }
+      const outcome = await this.securityScanner.scan(this.git.getRepoDir(project, slug), targetBranch, sourceBranch);
+      scannerFindings = outcome.findings;
+      // Per-tool status, not just found/not-found: both tools degrade silently
+      // on failure, so a crash must not read as a clean scan.
+      LogSink.info(`PR #${prId}: security scan — ${outcome.status || 'disabled'}`, TraceTags.REVIEWER);
+    }
+
     const allFindings: IAuthoredFinding[] = [];
     const reviewUsage: IModelUsage[] = [];
     for (const { model: rm, role } of runs) {
@@ -582,6 +622,7 @@ export class ReviewerService {
           prInfo,
           dockerImageOverride: dockerImage,
           personaDirective: PERSONA_DIRECTIVES[role],
+          scannerFindings: scannerFindingsForRole(role, scannerFindings),
         });
         for (const f of batch.findings) {
           allFindings.push({ ...f, author: rm.name, persona: role });

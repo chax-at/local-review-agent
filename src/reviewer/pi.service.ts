@@ -397,6 +397,17 @@ export interface IPiReviewResult {
   usage: IPiTokenUsage;
 }
 
+/**
+ * Writes one optional context file into the run directory and returns the
+ * ` @/workspace/<name>` reference to append to pi's argv. Empty or whitespace-only
+ * content writes nothing and contributes no reference.
+ */
+export function writeAttachment(tmpDir: string, name: string, content: string | null | undefined): string {
+  if (!content || !content.trim()) return '';
+  fs.writeFileSync(path.join(tmpDir, name), content);
+  return ` @/workspace/${name}`;
+}
+
 /** Optional context and overrides for a review batch — see reviewBatch. */
 export interface IReviewBatchOptions {
   codeStandards?: string | null;
@@ -405,6 +416,8 @@ export interface IReviewBatchOptions {
   repoContext?: string | null;
   /** PR title/description + Jira ticket blob, attached as pr-context.md. */
   prInfo?: string | null;
+  /** Semgrep/gitleaks findings for this diff, attached as scanner-findings.md. Only passed for security-relevant personas. */
+  scannerFindings?: string | null;
   dockerImageOverride?: string;
   personaDirective?: string;
 }
@@ -505,6 +518,7 @@ export class PiService {
    *  - `codeStandards`    → standards.md         (repo guideline files)
    *  - `prInfo`           → pr-context.md        (PR title/description + Jira ticket)
    *  - `repoContext`      → context.md           (pre-review exploration output)
+   *  - `scannerFindings`  → scanner-findings.md   (Semgrep/gitleaks output)
    *  - `existingComments` → existing-comments.md (already-posted PR comments)
    */
   public reviewBatch(diffs: string[], opts: IReviewBatchOptions = {}): IPiReviewResult {
@@ -514,28 +528,24 @@ export class PiService {
         fs.writeFileSync(path.join(tmpDir, `chunk-${i}.patch`), diffs[i]);
       }
 
-      const attachment = (name: string, content: string | null | undefined): string => {
-        if (!content || !content.trim()) return '';
-        fs.writeFileSync(path.join(tmpDir, name), content);
-        return ` @/workspace/${name}`;
-      };
-
-      const standardsArg = attachment('standards.md', opts.codeStandards);
-      const prInfoArg = attachment('pr-context.md', opts.prInfo);
-      const contextArg = attachment('context.md', opts.repoContext);
-      const commentsArg = attachment('existing-comments.md', opts.existingComments);
+      const standardsArg = writeAttachment(tmpDir, 'standards.md', opts.codeStandards);
+      const prInfoArg = writeAttachment(tmpDir, 'pr-context.md', opts.prInfo);
+      const contextArg = writeAttachment(tmpDir, 'context.md', opts.repoContext);
+      const scannerArg = writeAttachment(tmpDir, 'scanner-findings.md', opts.scannerFindings);
+      const commentsArg = writeAttachment(tmpDir, 'existing-comments.md', opts.existingComments);
 
       const prompt = buildReviewPrompt(
         opts.personaDirective ?? PERSONA_DIRECTIVES.generic,
         Boolean(commentsArg),
         Boolean(contextArg),
         Boolean(prInfoArg),
+        Boolean(scannerArg),
       );
 
       const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --no-tools`;
       const script = buildBatchScript(
         piBase,
-        `${standardsArg}${prInfoArg}${contextArg}${commentsArg}`,
+        `${standardsArg}${prInfoArg}${contextArg}${scannerArg}${commentsArg}`,
         prompt,
         diffs.length,
       );
