@@ -343,7 +343,11 @@ describe.skipIf(!SCANNERS_INSTALLED)('SecurityScanner integration (requires semg
         expect(line.startsWith('- `/')).toBe(false);
       }
 
-      // Control: an empty diff range must produce nothing.
+      // Control: an empty diff range must produce nothing. Semgrep's --baseline-commit
+      // diffs the working tree (not a branch argument) against the baseline, so the
+      // tree must actually be back on `main` — otherwise this would just re-scan the
+      // `feature` checkout above against its own baseline and "find" the same issue.
+      git(repoDir, ['checkout', '-q', 'main']);
       const control = await scanner.scan(repoDir, 'main', 'main');
       expect(control.findings).toBe('');
       expect(control.findings).not.toBe(outcome.findings);
