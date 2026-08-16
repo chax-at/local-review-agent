@@ -405,6 +405,8 @@ export interface IReviewBatchOptions {
   repoContext?: string | null;
   /** PR title/description + Jira ticket blob, attached as pr-context.md. */
   prInfo?: string | null;
+  /** Semgrep/gitleaks findings for this diff, attached as scanner-findings.md. Only passed for security-relevant personas. */
+  scannerFindings?: string | null;
   dockerImageOverride?: string;
   personaDirective?: string;
 }
@@ -505,6 +507,7 @@ export class PiService {
    *  - `codeStandards`    → standards.md         (repo guideline files)
    *  - `prInfo`           → pr-context.md        (PR title/description + Jira ticket)
    *  - `repoContext`      → context.md           (pre-review exploration output)
+   *  - `scannerFindings`  → scanner-findings.md   (Semgrep/gitleaks output)
    *  - `existingComments` → existing-comments.md (already-posted PR comments)
    */
   public reviewBatch(diffs: string[], opts: IReviewBatchOptions = {}): IPiReviewResult {
@@ -523,6 +526,7 @@ export class PiService {
       const standardsArg = attachment('standards.md', opts.codeStandards);
       const prInfoArg = attachment('pr-context.md', opts.prInfo);
       const contextArg = attachment('context.md', opts.repoContext);
+      const scannerArg = attachment('scanner-findings.md', opts.scannerFindings);
       const commentsArg = attachment('existing-comments.md', opts.existingComments);
 
       const prompt = buildReviewPrompt(
@@ -530,12 +534,13 @@ export class PiService {
         Boolean(commentsArg),
         Boolean(contextArg),
         Boolean(prInfoArg),
+        Boolean(scannerArg),
       );
 
       const piBase = `pi --mode json --provider ${this.provider} --model ${this.model} --no-session --no-tools`;
       const script = buildBatchScript(
         piBase,
-        `${standardsArg}${prInfoArg}${contextArg}${commentsArg}`,
+        `${standardsArg}${prInfoArg}${contextArg}${scannerArg}${commentsArg}`,
         prompt,
         diffs.length,
       );
