@@ -1,5 +1,11 @@
 // src/main.ts (renamed to main-server.ts in Task 15)
 import 'dotenv/config';
+// The config reads the .env above. The instrumentation must start before the other imports: the metrics API has no
+// proxy, so a meter that an import creates before the start stays a no-op.
+import { configureInstrumentation } from './instrumentation/instrumentation';
+
+configureInstrumentation();
+
 import LogSink from '@chax-at/log-sink';
 import config from './safe-config';
 import { configureLogSink } from './log/logsink.init';

@@ -21,6 +21,7 @@ export function toPullRequestCloud(wire: ICloudPullRequest): IPullRequest {
     sourceCommit: wire.source.commit.hash,
     targetBranch: wire.destination.branch.name,
     authorUsername: cloudUserId(wire.author),
+    reviewerUsernames: (wire.reviewers ?? []).map(cloudUserId),
   };
 }
 

@@ -1,6 +1,7 @@
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
-import type { LlmClient, ILlmResponse } from './llm-client';
+import { chatWithFallback, type LlmClient, type ILlmResponse } from './llm-client';
+import { mapWithConcurrency } from './concurrency';
 import type { IAuthoredFinding, IModelUsage } from '../types';
 import { InfoActionsSchema, infoActionsJsonSchema, parseWithSchema } from './llm-schemas';
 
@@ -100,6 +101,15 @@ export class InfoGatherer {
   constructor(
     private readonly llm: LlmClient | null,
     private readonly maxInfoTokens: number,
+    /** Tried when `llm` (e.g. an unreliable local model) fails a call. */
+    private readonly fallbackLlm: LlmClient | null = null,
+    /**
+     * Cap on concurrent per-file gather calls. A large PR has many files;
+     * firing one completion request per file at once can overwhelm a local
+     * model server (REVIEW_AUX_MAX_CONCURRENCY), which then times out every
+     * request instead of serving them.
+     */
+    private readonly maxConcurrency: number = 4,
   ) {}
 
   public get isEnabled(): boolean {
@@ -138,20 +148,20 @@ export class InfoGatherer {
       ? [...(requestsByFile?.keys() ?? [])].filter((p) => findingsByFile.has(p))
       : [...findingsByFile.keys()];
 
-    // Per-file gather calls are independent — run them in parallel so wall
-    // time scales with the slowest file, not the sum. `gather()` already
-    // catches LLM/parse/tool errors internally and returns empty context, so
-    // one slow or broken file can't poison the batch; allSettled adds a
-    // belt-and-braces guard for unexpected throws.
-    const settled = await Promise.allSettled(
-      targets.map(async (filePath) => {
-        const fileFindings = findingsByFile.get(filePath) ?? [];
-        if (fileFindings.length === 0) return null;
-        const requests = requestsByFile?.get(filePath);
-        const result = await this.gather(filePath, fileFindings, diff, fileContentByPath, tools, requests);
-        return { filePath, result };
-      }),
-    );
+    // Per-file gather calls are independent — run them in parallel (bounded
+    // by maxConcurrency so a large PR can't flood the model with one request
+    // per file at once) so wall time scales with the slowest batch, not the
+    // sum. `gather()` already catches LLM/parse/tool errors internally and
+    // returns empty context, so one slow or broken file can't poison the
+    // batch; allSettled-shaped results add a belt-and-braces guard for
+    // unexpected throws.
+    const settled = await mapWithConcurrency(targets, this.maxConcurrency, async (filePath) => {
+      const fileFindings = findingsByFile.get(filePath) ?? [];
+      if (fileFindings.length === 0) return null;
+      const requests = requestsByFile?.get(filePath);
+      const result = await this.gather(filePath, fileFindings, diff, fileContentByPath, tools, requests);
+      return { filePath, result };
+    });
 
     for (const s of settled) {
       if (s.status !== 'fulfilled' || s.value === null) {
@@ -234,20 +244,23 @@ export class InfoGatherer {
     const userMessage = sections.join('\n\n');
 
     let response: ILlmResponse;
+    let servedBy: LlmClient;
     try {
-      response = await this.llm.chat(systemPrompt, userMessage, {
+      const result = await chatWithFallback(this.llm, this.fallbackLlm, systemPrompt, userMessage, {
         jsonMode: true,
         jsonSchema: infoActionsJsonSchema,
       });
+      response = result.response;
+      servedBy = result.servedBy;
     } catch (err) {
       LogSink.warn(`Info gatherer ${this.llm.name} failed for ${filePath}: ${err}`, TraceTags.PI);
       return { context: '', usage: [], actionsApplied: 0 };
     }
 
-    const usage = [this.trackUsage(response)];
+    const usage = [this.trackUsage(response, servedBy)];
     const parsed = parseWithSchema(response.content, InfoActionsSchema);
     if (!parsed) {
-      LogSink.warn(`Info gatherer ${this.llm.name} returned unparseable response for ${filePath}`, TraceTags.PI);
+      LogSink.warn(`Info gatherer ${servedBy.name} returned unparseable response for ${filePath}`, TraceTags.PI);
       return { context: '', usage, actionsApplied: 0 };
     }
 
@@ -280,13 +293,12 @@ export class InfoGatherer {
     };
   }
 
-  private trackUsage(response: ILlmResponse): IModelUsage {
-    const llm = this.llm!;
+  private trackUsage(response: ILlmResponse, servedBy: LlmClient): IModelUsage {
     const cost =
-      (response.inputTokens / 1_000_000) * llm.inputCostPer1M +
-      (response.outputTokens / 1_000_000) * llm.outputCostPer1M;
+      (response.inputTokens / 1_000_000) * servedBy.inputCostPer1M +
+      (response.outputTokens / 1_000_000) * servedBy.outputCostPer1M;
     return {
-      modelName: llm.name,
+      modelName: servedBy.name,
       inputTokens: response.inputTokens,
       outputTokens: response.outputTokens,
       costEur: cost,

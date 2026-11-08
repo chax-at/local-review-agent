@@ -110,3 +110,17 @@ describe('CarrotConfigService', () => {
     expect(service.getCycleCarrotGaps().missingFile).toContain('PROJ/repo');
   });
 });
+
+describe('parseCarrotConfig ticket fields', () => {
+  it('reads jiraProjects and jiraDoneTransition', () => {
+    const cfg = parseCarrotConfig('{ "prReview": true, "jiraProjects": ["abc", "CORE"], "jiraDoneTransition": "In Review" }');
+    expect(cfg?.jiraProjects).toEqual(['abc', 'CORE']);
+    expect(cfg?.jiraDoneTransition).toBe('In Review');
+  });
+
+  it('leaves both undefined when absent', () => {
+    const cfg = parseCarrotConfig('{ "prReview": true }');
+    expect(cfg?.jiraProjects).toBeUndefined();
+    expect(cfg?.jiraDoneTransition).toBeUndefined();
+  });
+});

@@ -1,4 +1,9 @@
 {
+  "App": {
+    "Name": "local-git-reviewer",
+    "Environment": "local",
+    "Release": "unknown"
+  },
   "Bitbucket": {
     "BaseUrl": "",
     "BotUsername": "carrot",
@@ -9,6 +14,11 @@
     "BotUsername": "",
     "AccessToken": "",
     "Email": ""
+  },
+  "Forgejo": {
+    "BaseUrl": "",
+    "Token": "",
+    "BotUsername": ""
   },
   "Polling": {
     "IntervalMs": 300000
@@ -25,7 +35,15 @@
     "MaxInfoTokens": 8000,
     "MaxExplorationTokens": 50000,
     "MaxValidators": 2,
-    "SecurityScannersEnabled": false
+    "SecurityScannersEnabled": false,
+    "AlwaysJudge": false,
+    "JudgeModelSlot": 0,
+    "AuxModelSlot": 0,
+    "AuxFallbackModelSlot": 0,
+    "AuxMaxConcurrency": 4
+  },
+  "Implement": {
+    "ModelSlot": 0
   },
   "Model1": {
     "Name": "Model1",
@@ -95,6 +113,23 @@
     "DockerImage": "lgr-pi-runner:latest",
     "TimeoutMs": 300000
   },
+  "Model5": {
+    "Name": "Model5",
+    "ApiKey": "",
+    "ApiBase": "",
+    "Model": "",
+    "AuthHeader": "",
+    "SupportsStructuredOutput": true,
+    "MaxTokenParam": "max_completion_tokens",
+    "InputTokenCostPer1M": 0,
+    "OutputTokenCostPer1M": 0,
+    "Review": false,
+    "Validate": true,
+    "Roles": "generic",
+    "Provider": "azure-openai-responses",
+    "DockerImage": "lgr-pi-runner:latest",
+    "TimeoutMs": 300000
+  },
   "Diagnostics": {
     "DebugLogs": false,
     "Logging": {
@@ -118,6 +153,13 @@
         "MinLevel": 0,
         "MaxLevel": 7
       }
+    },
+    "OpenTelemetry": {
+      "Enabled": false,
+      "Endpoint": "",
+      "TenantId": 50,
+      "MetricsExportIntervalSeconds": 60,
+      "TraceSampleRatio": 0.1
     }
   },
   "WorkDir": "./repos",

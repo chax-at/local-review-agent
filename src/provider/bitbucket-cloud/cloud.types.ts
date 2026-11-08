@@ -34,6 +34,7 @@ export interface ICloudPullRequest {
     commit?: { hash: string };
   };
   author: ICloudUser;
+  reviewers?: ICloudUser[];
 }
 
 export interface ICloudCommentInline {

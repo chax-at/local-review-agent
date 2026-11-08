@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
-import type { IAppState, IPrState } from '../types';
+import type { IAppState, IPrState, ITicketState } from '../types';
 
 export class StateService {
   private readonly statePath: string;
@@ -63,6 +63,17 @@ export class StateService {
     this.state.repos[repoKey] = repoState;
   }
 
+  public getTicketState(key: string): ITicketState | undefined {
+    return this.state.tickets?.[key];
+  }
+
+  public setTicketState(key: string, ticketState: ITicketState): void {
+    if (this.state.tickets === undefined) {
+      this.state.tickets = {};
+    }
+    this.state.tickets[key] = ticketState;
+  }
+
   public getState(): IAppState {
     return this.state;
   }
@@ -82,6 +93,20 @@ export class StateService {
       if (Object.keys(repoState.pullRequests).length === 0) {
         delete this.state.repos[repoKey];
       }
+    }
+    let prunedTickets = 0;
+    for (const [key, ticketState] of Object.entries(this.state.tickets ?? {})) {
+      if (!ticketState) continue;
+      if (new Date(ticketState.lastRunAt).getTime() < cutoff) {
+        delete this.state.tickets![key];
+        prunedTickets++;
+      }
+    }
+    if (prunedTickets > 0) {
+      LogSink.debug(
+        `Pruned ${prunedTickets} stale ticket state entries (older than ${pruneDays} days)`,
+        TraceTags.STATE,
+      );
     }
     if (pruned > 0) {
       LogSink.debug(`Pruned ${pruned} stale PR state entries (older than ${pruneDays} days)`, TraceTags.STATE);

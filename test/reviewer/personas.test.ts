@@ -5,6 +5,8 @@ import {
   parseRoles,
   isCorrectnessCovered,
   buildReviewPrompt,
+  STANDARDS_REQUIRED_PERSONAS,
+  LINTER_TONE,
 } from '../../src/reviewer/personas';
 
 describe('parseRoles', () => {
@@ -62,6 +64,19 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain(PERSONA_DIRECTIVES.security);
     expect(prompt).toContain('Ignore lock files');
     expect(prompt).not.toContain('existing-comments.md');
+  });
+
+  it('tells every role to describe the problem only and not to propose a fix', () => {
+    for (const directive of Object.values(PERSONA_DIRECTIVES)) {
+      const prompt = buildReviewPrompt(directive, false);
+      expect(prompt).toContain('Describe the problem only. Do not propose a fix');
+    }
+  });
+
+  it('tells every role to write in a neutral linter tone', () => {
+    for (const directive of Object.values(PERSONA_DIRECTIVES)) {
+      expect(buildReviewPrompt(directive, false)).toContain(LINTER_TONE);
+    }
   });
 
   it('appends the comments line when existing comments are present', () => {
@@ -122,5 +137,31 @@ describe('buildReviewPrompt', () => {
       expect(typeof PERSONA_DIRECTIVES[p]).toBe('string');
       expect(PERSONA_DIRECTIVES[p].length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('ai-generated-code persona', () => {
+  it('is a recognized role parseRoles accepts', () => {
+    expect(parseRoles('ai-generated-code', 'Model5')).toEqual(['ai-generated-code']);
+  });
+
+  it('has a non-empty directive that targets concrete LLM-authored failure patterns, not meta-flagging', () => {
+    const directive = PERSONA_DIRECTIVES['ai-generated-code'];
+    expect(typeof directive).toBe('string');
+    expect(directive.length).toBeGreaterThan(0);
+    expect(directive.toLowerCase()).not.toContain('looks ai-generated');
+    expect(directive.toLowerCase()).not.toContain('looks ai-written');
+  });
+
+  it('is not in STANDARDS_REQUIRED_PERSONAS (no guideline file to check against)', () => {
+    expect(STANDARDS_REQUIRED_PERSONAS.has('ai-generated-code')).toBe(false);
+  });
+
+  it('does not count toward isCorrectnessCovered on its own', () => {
+    expect(isCorrectnessCovered([['ai-generated-code']])).toBe(false);
+  });
+
+  it('REVIEW_PERSONAS includes it exactly once', () => {
+    expect(REVIEW_PERSONAS.filter((p) => p === 'ai-generated-code')).toHaveLength(1);
   });
 });

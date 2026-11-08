@@ -1,5 +1,5 @@
 // test/provider/bitbucket-cloud/cloud.client.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BitbucketCloudProvider } from '../../../src/provider/bitbucket-cloud/cloud.client';
 
 const mockFetch = vi.fn();
@@ -94,7 +94,10 @@ describe('BitbucketCloudProvider — discovery and PRs', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        values: [{ name: 'main', target: { hash: 'h1' } }, { name: 'release/1', target: { hash: 'h2' } }],
+        values: [
+          { name: 'main', target: { hash: 'h1' } },
+          { name: 'release/1', target: { hash: 'h2' } },
+        ],
       }),
     });
     const branches = await provider.listBranches('ws', 'api');
@@ -107,8 +110,12 @@ describe('BitbucketCloudProvider — discovery and PRs', () => {
       json: async () => ({
         values: [
           {
-            id: 1, title: 't', state: 'OPEN', draft: false,
-            created_on: '2026-01-01T00:00:00Z', updated_on: '2026-01-02T00:00:00Z',
+            id: 1,
+            title: 't',
+            state: 'OPEN',
+            draft: false,
+            created_on: '2026-01-01T00:00:00Z',
+            updated_on: '2026-01-02T00:00:00Z',
             source: { branch: { name: 'feat' }, commit: { hash: 'a' } },
             destination: { branch: { name: 'main' } },
             author: { account_id: 'u' },
@@ -129,8 +136,12 @@ describe('BitbucketCloudProvider — discovery and PRs', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        id: 9, title: 't', state: 'OPEN', draft: false,
-        created_on: '2026-01-01T00:00:00Z', updated_on: '2026-01-01T00:00:00Z',
+        id: 9,
+        title: 't',
+        state: 'OPEN',
+        draft: false,
+        created_on: '2026-01-01T00:00:00Z',
+        updated_on: '2026-01-01T00:00:00Z',
         source: { branch: { name: 'a' }, commit: { hash: 'h' } },
         destination: { branch: { name: 'b' } },
         author: { account_id: 'u' },
@@ -144,8 +155,12 @@ describe('BitbucketCloudProvider — discovery and PRs', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        id: 9, title: 't', state: 'MERGED', draft: false,
-        created_on: '2026-01-01T00:00:00Z', updated_on: '2026-01-01T00:00:00Z',
+        id: 9,
+        title: 't',
+        state: 'MERGED',
+        draft: false,
+        created_on: '2026-01-01T00:00:00Z',
+        updated_on: '2026-01-01T00:00:00Z',
         source: { branch: { name: 'a' }, commit: { hash: 'h' } },
         destination: { branch: { name: 'b' } },
         author: { account_id: 'u' },
@@ -175,6 +190,17 @@ describe('BitbucketCloudProvider — discovery and PRs', () => {
   it('throws GitProviderAuthError on 401', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({}) });
     await expect(provider.listRepos('ws')).rejects.toMatchObject({ name: 'GitProviderAuthError' });
+  });
+
+  it('getDefaultBranch reads mainbranch.name from the repository resource', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ mainbranch: { name: 'main' } }) });
+    expect(await provider.getDefaultBranch('ws', 'r')).toBe('main');
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.bitbucket.org/2.0/repositories/ws/r');
+  });
+
+  it('getDefaultBranch returns null on a non-OK response', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404, text: async () => '' });
+    expect(await provider.getDefaultBranch('ws', 'r')).toBeNull();
   });
 });
 
@@ -206,9 +232,7 @@ describe('BitbucketCloudProvider — comments', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
-        values: [
-          { id: 10, content: { raw: 't' }, user: { account_id: 'a' }, created_on: '' },
-        ],
+        values: [{ id: 10, content: { raw: 't' }, user: { account_id: 'a' }, created_on: '' }],
       }),
     });
     const activities = await provider.getActivities('ws', 'r', 1);
@@ -261,6 +285,59 @@ describe('BitbucketCloudProvider — comments', () => {
   });
 });
 
+describe('BitbucketCloudProvider — retries a transient 5xx on comment posting', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('retries once on a 500 and succeeds on the second attempt', async () => {
+    const provider = new BitbucketCloudProvider('ws', 'tok');
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'Something went wrong' })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+
+    const promise = provider.postInlineComment('ws', 'r', 1, {
+      text: 'note',
+      path: 'a.ts',
+      line: 1,
+      lineKind: 'added',
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await promise;
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a 4xx response — that is a real client error, not transient', async () => {
+    const provider = new BitbucketCloudProvider('ws', 'tok');
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 400, text: async () => 'bad anchor' });
+
+    await provider.postInlineComment('ws', 'r', 1, { text: 'note', path: 'a.ts', line: 1, lineKind: 'added' });
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after exhausting all attempts and returns the last 5xx response', async () => {
+    const provider = new BitbucketCloudProvider('ws', 'tok');
+    mockFetch.mockResolvedValue({ ok: false, status: 503, text: async () => 'still down' });
+
+    const promise = provider.postInlineComment('ws', 'r', 1, {
+      text: 'note',
+      path: 'a.ts',
+      line: 1,
+      lineKind: 'added',
+    });
+    await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000);
+    await promise;
+
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+});
+
 describe('BitbucketCloudProvider — PR create, builds, files', () => {
   let provider: BitbucketCloudProvider;
   beforeEach(() => {
@@ -294,9 +371,7 @@ describe('BitbucketCloudProvider — PR create, builds, files', () => {
     });
     const statuses = await provider.getBuildStatuses('ws', 'r', 'abc123');
     expect(statuses.map((s) => s.state)).toEqual(['failed', 'successful']);
-    expect(mockFetch.mock.calls[0][0]).toBe(
-      'https://api.bitbucket.org/2.0/repositories/ws/r/commit/abc123/statuses',
-    );
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.bitbucket.org/2.0/repositories/ws/r/commit/abc123/statuses');
   });
 
   it('getFileContent returns raw text body', async () => {
@@ -306,8 +381,14 @@ describe('BitbucketCloudProvider — PR create, builds, files', () => {
     });
     const content = await provider.getFileContent('ws', 'r', 'README.md', { at: 'main', quiet: true });
     expect(content).toBe('hello\nworld');
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.bitbucket.org/2.0/repositories/ws/r/src/main/README.md');
+  });
+
+  it('getFileContent encodes each segment of the ref and the file path', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, text: async () => 'x' });
+    expect(await provider.getFileContent('ws', 'r', 'docs/a b#1.md', { at: 'feature/x', quiet: true })).toBe('x');
     expect(mockFetch.mock.calls[0][0]).toBe(
-      'https://api.bitbucket.org/2.0/repositories/ws/r/src/main/README.md',
+      'https://api.bitbucket.org/2.0/repositories/ws/r/src/feature/x/docs/a%20b%231.md',
     );
   });
 

@@ -40,6 +40,24 @@ export interface IPrState {
   reviewFailures?: number;
 }
 
+/** Per-ticket record of the Jira ticket implementation flow (see TicketService). */
+export interface ITicketState {
+  /** `${project}/${slug}` of the repo that owns the ticket's project key. */
+  repoKey: string;
+  /** Branch carrot created or found for this ticket. */
+  branch?: string;
+  /** PR carrot opened from that branch. */
+  prId?: number;
+  /** Consecutive failed runs. Reset to 0 on success or after the final hand-back. */
+  attempts: number;
+  /** Highest Jira comment id seen when the last run started. */
+  lastCommentId: number;
+  /** ISO time of the last run or hand-back; compared with the assignment time. */
+  lastRunAt: string;
+  /** Last failure text, for the final hand-back comment. */
+  lastError?: string;
+}
+
 export interface IAppState {
   repos: Partial<
     Record<
@@ -49,6 +67,7 @@ export interface IAppState {
       }
     >
   >;
+  tickets?: Partial<Record<string, ITicketState>>;
 }
 
 export interface IDiffChunk {

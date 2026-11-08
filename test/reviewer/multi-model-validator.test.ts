@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { MultiModelValidator, pickRandom } from '../../src/reviewer/multi-model-validator';
+import {
+  MultiModelValidator,
+  pickRandom,
+  formatJudgedValidationNotes,
+  NO_FIX_NEEDED,
+} from '../../src/reviewer/multi-model-validator';
 import type { IFixProposal } from '../../src/reviewer/multi-model-validator';
 import type { LlmClient } from '../../src/reviewer/llm-client';
 import type { IReviewFinding, IAuthoredFinding } from '../../src/types';
@@ -213,6 +218,9 @@ describe('MultiModelValidator', () => {
       expect(result.discardedRound2).toBe(0);
       expect(m1.chat).toHaveBeenCalledTimes(2);
       expect(m2.chat).toHaveBeenCalledTimes(2);
+      // Neither the round-1 vote nor the deliberation may reject a finding for lacking a fix.
+      expect((m1.chat as any).mock.calls[0][0]).toContain(NO_FIX_NEEDED);
+      expect((m1.chat as any).mock.calls[1][0]).toContain(NO_FIX_NEEDED);
     });
 
     it('discards a contested finding only when all voters reject in round 2', async () => {
@@ -457,6 +465,308 @@ describe('MultiModelValidator', () => {
       expect(followUpGather).toHaveBeenCalledTimes(1);
       const requestsByFile = followUpGather.mock.calls[0][0] as Map<string, string[]>;
       expect(requestsByFile.get('test.ts')).toEqual(['src/dto.ts']);
+    });
+  });
+
+  describe('formatJudgedValidationNotes', () => {
+    it("combines round-1 votes, pi evidence, and the judge's reasoning", () => {
+      const entries = [{ model: 'M1', phase: 'round1' as const, relevant: true, thought: 'looks buggy' }];
+      const out = formatJudgedValidationNotes(
+        entries,
+        { supported: true, evidence: 'confirmed in code' },
+        'keeping it',
+        'Fable',
+        'Model1',
+      );
+      expect(out).toContain('looks buggy');
+      expect(out).toContain('confirmed in code');
+      expect(out).toContain('keeping it');
+    });
+
+    it('attributes the code-verification evidence line to the model that ran pi', () => {
+      const out = formatJudgedValidationNotes(
+        [],
+        { supported: true, evidence: 'confirmed in code' },
+        'keeping it',
+        'Fable',
+        'Model1',
+      );
+      expect(out).toContain('pi (Model1) verified against the code');
+    });
+
+    it('falls back to an unnamed pi when no model name is available', () => {
+      const out = formatJudgedValidationNotes(
+        [],
+        { supported: true, evidence: 'confirmed in code' },
+        'keeping it',
+        'Fable',
+        null,
+      );
+      expect(out).toContain('pi verified against the code');
+      expect(out).not.toContain('pi (');
+    });
+
+    it('omits the evidence line when no pi evidence is available', () => {
+      const out = formatJudgedValidationNotes([], undefined, 'no evidence, deciding from votes', 'Fable', null);
+      expect(out).not.toContain('pi verified against the code');
+      expect(out).toContain('no evidence, deciding from votes');
+    });
+
+    it('attributes the final decision to the judge model by name', () => {
+      const out = formatJudgedValidationNotes([], undefined, 'keeping it', 'Fable', null);
+      expect(out).toContain('Fable says');
+    });
+  });
+
+  describe('validateFindings with piVerify (judge replaces round-2 revote)', () => {
+    it("judge keeps a split finding using round-1 votes plus pi's evidence, without a round-2 revote", async () => {
+      const m1 = mockClientMultiRound(
+        'M1',
+        '{"results":[{"index":0,"relevant":true,"thought":"real bug","infoRequest":""}]}', // round-1 vote
+        '{"results":[{"index":0,"relevant":true,"thought":"evidence confirms it"}]}', // judge decision (models[0] doubles as judge)
+      );
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2]);
+      const finding = authored();
+      const piVerify = vi.fn().mockResolvedValue({
+        results: new Map([[0, { supported: true, evidence: 'confirmed: the function does throw here' }]]),
+        usage: [],
+      });
+
+      const result = await v.validateFindings([finding], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(piVerify).toHaveBeenCalledWith([finding], [0]);
+      expect(result.findings).toHaveLength(1);
+      expect(result.discardedRound2).toBe(0);
+      expect(result.findings[0].validationNotes).toContain('confirmed: the function does throw here');
+      expect(result.findings[0].validationNotes).toContain('evidence confirms it');
+      // 2 calls to M1 (round-1 vote + judge), 1 to M2 (round-1 vote only) — no
+      // round-2 revote call goes to either model.
+      expect(m1.chat).toHaveBeenCalledTimes(2);
+      expect(m2.chat).toHaveBeenCalledTimes(1);
+      // The judge's system prompt tells it to weigh code evidence.
+      expect((m1.chat as any).mock.calls[1][0]).toContain('evidence');
+      expect((m1.chat as any).mock.calls[1][0]).toContain(NO_FIX_NEEDED);
+    });
+
+    it('judge discards a split finding when pi evidence contradicts it', async () => {
+      const m1 = mockClientMultiRound(
+        'M1',
+        '{"results":[{"index":0,"relevant":true,"thought":"looks like a bug","infoRequest":""}]}',
+        '{"results":[{"index":0,"relevant":false,"thought":"evidence shows this cannot happen"}]}',
+      );
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2]);
+      const piVerify = vi.fn().mockResolvedValue({
+        results: new Map([[0, { supported: false, evidence: 'the guard clause already prevents this' }]]),
+        usage: [],
+      });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+      expect(result.findings).toHaveLength(0);
+      expect(result.discardedRound2).toBe(1);
+    });
+
+    it('a failed pi verification degrades to judging on round-1 votes alone, not a thrown error', async () => {
+      const m1 = mockClientMultiRound(
+        'M1',
+        '{"results":[{"index":0,"relevant":true,"thought":"real","infoRequest":""}]}',
+        '{"results":[{"index":0,"relevant":true,"thought":"deciding without evidence"}]}',
+      );
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2]);
+      const piVerify = vi.fn().mockRejectedValue(new Error('docker exploded'));
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+      expect(result.findings).toHaveLength(1);
+      expect(result.findings[0].validationNotes).toContain('deciding without evidence');
+    });
+
+    it('conservatively keeps a split finding the judge itself authored, without calling the judge', async () => {
+      // 3 models so round 1 can produce a real split while excluding the
+      // author (M1, who also happens to be models[0] / the judge): M2 and M3
+      // vote 1-1, so it's contested — but M1 can't judge its own finding, and
+      // there's no second judge to fall back to, so it must be kept as-is.
+      const m1 = mockClient('M1', 'unused — must never be called');
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":true,"thought":"looks real","infoRequest":""}]}');
+      const m3 = mockClient('M3', '{"results":[{"index":0,"relevant":false,"thought":"looks like noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2, m3]);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings(
+        [authored({ author: 'M1' })],
+        'diff',
+        noCtx,
+        undefined,
+        undefined,
+        undefined,
+        piVerify,
+      );
+
+      expect(m1.chat).not.toHaveBeenCalled();
+      expect(result.findings).toHaveLength(1);
+      expect(result.discardedRound2).toBe(0);
+      expect(result.findings[0].validationNotes).not.toContain('Final decision');
+      expect(result.findings[0].validationNotes).toContain('looks real');
+      expect(result.findings[0].validationNotes).toContain('looks like noise');
+    });
+
+    it('conservatively keeps the finding when the judge call throws', async () => {
+      const chatFn = vi
+        .fn()
+        .mockResolvedValueOnce({
+          content: '{"results":[{"index":0,"relevant":true,"thought":"round1 real","infoRequest":""}]}',
+          inputTokens: 10,
+          outputTokens: 5,
+        })
+        .mockRejectedValueOnce(new Error('judge model unavailable'));
+      const m1 = { name: 'M1', inputCostPer1M: 1, outputCostPer1M: 2, chat: chatFn } as any;
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"round1 noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2]);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(result.findings).toHaveLength(1);
+      expect(result.discardedRound2).toBe(0);
+      expect(result.findings[0].validationNotes).not.toContain('Final decision');
+      expect(result.findings[0].validationNotes).toContain('round1 real');
+      expect(result.findings[0].validationNotes).toContain('round1 noise');
+    });
+
+    it('conservatively keeps the finding when the judge returns unparseable JSON', async () => {
+      const m1 = mockClientMultiRound(
+        'M1',
+        '{"results":[{"index":0,"relevant":true,"thought":"round1 real","infoRequest":""}]}',
+        'not json at all',
+      );
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"round1 noise","infoRequest":""}]}');
+      const v = new MultiModelValidator([m1, m2]);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(result.findings).toHaveLength(1);
+      expect(result.discardedRound2).toBe(0);
+      expect(result.findings[0].validationNotes).not.toContain('Final decision');
+      expect(result.findings[0].validationNotes).toContain('round1 real');
+      expect(result.findings[0].validationNotes).toContain('round1 noise');
+    });
+
+    it('conservatively keeps a finding the judge omits from its response', async () => {
+      const findingA = authored({ comment: 'A' });
+      const findingB = authored({ comment: 'B' });
+      const m1 = mockClientMultiRound(
+        'M1',
+        '{"results":[{"index":0,"relevant":true,"thought":"r1-A","infoRequest":""},{"index":1,"relevant":true,"thought":"r1-B","infoRequest":""}]}',
+        // Judge only decides index 0 (global finding A); index 1 (finding B) is omitted.
+        '{"results":[{"index":0,"relevant":true,"thought":"judge decided A"}]}',
+      );
+      const m2 = mockClient(
+        'M2',
+        '{"results":[{"index":0,"relevant":false,"thought":"r1-noise-A","infoRequest":""},{"index":1,"relevant":false,"thought":"r1-noise-B","infoRequest":""}]}',
+      );
+      const v = new MultiModelValidator([m1, m2]);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings(
+        [findingA, findingB],
+        'diff',
+        noCtx,
+        undefined,
+        undefined,
+        undefined,
+        piVerify,
+      );
+
+      expect(result.findings).toHaveLength(2);
+      expect(result.discardedRound2).toBe(0);
+      const kept0 = result.findings.find((f) => f.comment === 'A')!;
+      const kept1 = result.findings.find((f) => f.comment === 'B')!;
+      expect(kept0.validationNotes).toContain('judge decided A');
+      expect(kept1.validationNotes).not.toContain('Final decision');
+      expect(kept1.validationNotes).toContain('r1-B');
+      expect(kept1.validationNotes).toContain('r1-noise-B');
+    });
+  });
+
+  describe('validateFindings with a pinned judgeModel (REVIEW_JUDGE_MODEL_SLOT)', () => {
+    it('calls the pinned judge, not models[0], to decide a split finding', async () => {
+      const m1 = mockClient('M1', '{"results":[{"index":0,"relevant":true,"thought":"round1 real","infoRequest":""}]}');
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"round1 noise","infoRequest":""}]}');
+      const judge = mockClient(
+        'Fable',
+        '{"results":[{"index":0,"relevant":true,"thought":"fable decides"}]}',
+      );
+      // judgeModel (3rd ctor arg) is not even in the round-1 voting pool —
+      // the pin is independent of who votes.
+      const v = new MultiModelValidator([m1, m2], judge);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(judge.chat).toHaveBeenCalledTimes(1);
+      expect(result.findings).toHaveLength(1);
+      expect(result.findings[0].validationNotes).toContain('fable decides');
+    });
+
+    it('survives withRandomSubset — the pin is not part of the shuffled pool', () => {
+      const m1 = mockClient('M1', '');
+      const m2 = mockClient('M2', '');
+      const judge = mockClient('Fable', '');
+      const v = new MultiModelValidator([m1, m2], judge, true);
+      const subset = v.withRandomSubset(1);
+      // modelNames only reflects the round-1 voting pool; the pinned judge is
+      // carried on the instance regardless of what the shuffle picked.
+      expect(subset.modelNames).toHaveLength(1);
+      expect(['M1', 'M2']).toContain(subset.modelNames[0]);
+    });
+  });
+
+  describe('validateFindings with alwaysJudge (REVIEW_ALWAYS_JUDGE)', () => {
+    it('sends a unanimous-accept finding to the judge too, not just split votes', async () => {
+      const m1 = mockClient('M1', '{"results":[{"index":0,"relevant":true,"thought":"round1 real","infoRequest":""}]}');
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":true,"thought":"round1 real too","infoRequest":""}]}');
+      const judge = mockClient('Fable', '{"results":[{"index":0,"relevant":true,"thought":"fable confirms"}]}');
+      const v = new MultiModelValidator([m1, m2], judge, true);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      // Both round-1 voters agreed (unanimous), yet the judge still ran.
+      expect(piVerify).toHaveBeenCalledWith([expect.anything()], [0]);
+      expect(judge.chat).toHaveBeenCalledTimes(1);
+      expect(result.findings).toHaveLength(1);
+      expect(result.findings[0].validationNotes).toContain('fable confirms');
+    });
+
+    it('still skips the judge for a finding round 1 unanimously rejected', async () => {
+      const m1 = mockClient('M1', '{"results":[{"index":0,"relevant":false,"thought":"noise","infoRequest":""}]}');
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":false,"thought":"noise too","infoRequest":""}]}');
+      const judge = mockClient('Fable', 'unused — must never be called');
+      const v = new MultiModelValidator([m1, m2], judge, true);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(judge.chat).not.toHaveBeenCalled();
+      expect(piVerify).not.toHaveBeenCalled();
+      expect(result.findings).toHaveLength(0);
+      expect(result.discardedRound1).toBe(1);
+    });
+
+    it('without alwaysJudge, a unanimous-accept finding posts directly — no judge call', async () => {
+      const m1 = mockClient('M1', '{"results":[{"index":0,"relevant":true,"thought":"round1 real","infoRequest":""}]}');
+      const m2 = mockClient('M2', '{"results":[{"index":0,"relevant":true,"thought":"round1 real too","infoRequest":""}]}');
+      const judge = mockClient('Fable', 'unused — must never be called');
+      const v = new MultiModelValidator([m1, m2], judge, false);
+      const piVerify = vi.fn().mockResolvedValue({ results: new Map(), usage: [] });
+
+      const result = await v.validateFindings([authored()], 'diff', noCtx, undefined, undefined, undefined, piVerify);
+
+      expect(judge.chat).not.toHaveBeenCalled();
+      expect(piVerify).not.toHaveBeenCalled();
+      expect(result.findings).toHaveLength(1);
     });
   });
 

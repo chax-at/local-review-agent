@@ -1,7 +1,14 @@
 /** Review roles a model can be assigned. `generic` reproduces the original
  *  all-purpose review prompt; the others narrow the model's attention to one
  *  lens so the council covers each lens explicitly. */
-export const REVIEW_PERSONAS = ['correctness', 'security', 'readability', 'generic', 'vegetable-police'] as const;
+export const REVIEW_PERSONAS = [
+  'correctness',
+  'security',
+  'readability',
+  'generic',
+  'vegetable-police',
+  'ai-generated-code',
+] as const;
 
 export type ReviewPersona = (typeof REVIEW_PERSONAS)[number];
 
@@ -35,7 +42,22 @@ export const PERSONA_DIRECTIVES: Record<ReviewPersona, string> = {
     'Systematically check every change in the diff against every written rule and flag each violation. ' +
     'In each comment, cite the specific guideline being violated. Do not report issues that are not ' +
     'grounded in a written guideline.',
+  'ai-generated-code':
+    'Focus ONLY on failure patterns typical of LLM-authored code: calls to APIs, methods, or imports that do not ' +
+    'actually exist in this codebase or its dependencies; tests that assert the implementation does what it does ' +
+    '(mirroring the code) rather than checking real behavior or edge cases; logic that reads as confident and ' +
+    'well-commented but is subtly wrong; and overly generic error handling that silently swallows a real failure. ' +
+    'Report only concrete, verifiable issues you can point to in the diff — never an ' +
+    "unsupported claim about the code's authorship with no actionable content.",
 };
+
+/** Tone rule for every model-written text that reaches the PR: the review
+ *  comment, the deduplicator's merged comment, and the validators' thoughts and
+ *  pi's evidence (posted under the comment). Findings must read like linter output. */
+export const LINTER_TONE =
+  'Write all text you return like a linter message: neutral, impersonal and factual. Do not address or judge ' +
+  'the author (no "you", "should have", "forgot", "careless"). Do not use certainty or minimizing words ' +
+  '("clearly", "obviously", "simply", "just"). Do not use exclamation marks, rhetorical questions or emphasis.';
 
 /**
  * Parse a model's comma-separated `Roles` env string into validated personas.
@@ -94,6 +116,13 @@ export const buildReviewPrompt = (
     'Review this PR diff. Return a JSON object with a "findings" array.',
     'Each finding must have: filePath (string), line (number), severity (concern|suggestion|note), comment (string).',
     directive,
+    // Reviewers only see the diff plus read-only context, so a proposed fix is
+    // a guess about code they have not read. Nothing downstream checks it:
+    // pi verification and the judge test the CLAIM, not the fix, and the
+    // comment is posted verbatim. Keep the finding to the problem.
+    'Describe the problem only. Do not propose a fix, a replacement, or a refactoring — the developer decides how to ' +
+      'address it.',
+    LINTER_TONE,
     'Only review the diff, not surrounding code.',
     'Ignore lock files (package-lock.json, yarn.lock, pnpm-lock.yaml, etc.) entirely.',
     'If no issues found, return {"findings": []}.',

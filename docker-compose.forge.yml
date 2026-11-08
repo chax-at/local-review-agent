@@ -1,0 +1,8 @@
+---
+# Override for docker-compose.yml: runs the Forgejo poller instead of the
+# Bitbucket Server poller. Apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.forge.yml up -d
+# The file name matches the deploy matrix instance `forge`.
+services:
+  local-git-reviewer:
+    command: ["node", "dist/src/main-forgejo.js"]

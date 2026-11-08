@@ -1,6 +1,6 @@
 # local-git-reviewer (agent carrot)
 
-Automated PR reviewer for Bitbucket Server / Data Center and Bitbucket Cloud. Reviews code with AI and applies fixes on request. Configured per-repo via `.carrot.jsonc`.
+Automated PR reviewer for Bitbucket Server / Data Center, Bitbucket Cloud and Forgejo. Reviews code with AI and applies fixes on request. Configured per-repo via `.carrot.jsonc`.
 
 
 ``` 
@@ -11,17 +11,20 @@ However, it works really well, so feel free to use and change it on your behalf.
 ```
 
 
+_This README was last audited for accuracy against commit `6646234` — env vars, config, deploy, and workflow docs were checked line-by-line against the code as of that commit. If it's been a while, `git log 6646234..HEAD` shows what may have drifted since._
+
 ## What it does
 
 1. **PR code review** — AI reviews every new PR and posts inline comments (severity, file, line)
 2. **Mention commands** — `@carrot` in PR comments to request fixes, reverts, re-reviews, or ask questions
+3. **Jira tickets** — assign a ticket to the bot's Jira user and it implements the ticket with pi on a `feature/KEY-123-slug` branch, opens a PR, reports on the ticket, and assigns it back
 
 ## Prerequisites
 
 - Node.js (v24+)
 - Git
 - Docker (for isolated AI review containers)
-- Bitbucket Server / Data Center instance OR a Bitbucket Cloud workspace
+- Bitbucket Server / Data Center instance, a Bitbucket Cloud workspace, OR a Forgejo instance
 
 ## Setup
 
@@ -46,19 +49,26 @@ cp .env.sample .env
 | `MODEL1_INPUT_COST` | Optional | Cost per 1M input tokens (for cost tracking in review comments) |
 | `MODEL1_OUTPUT_COST` | Optional | Cost per 1M output tokens |
 | `MODEL1_REVIEW` | Optional | Set `true` to run the review pass (Docker pi-runner) with this model; the first review-enabled model also handles fix/propose/lint |
-| `MODEL1_ROLES` | Optional | Review personas this model runs, comma-separated (e.g. `security,correctness`). The model runs the review pass **once per role**, each with a role-focused prompt. Allowed: `correctness`, `security`, `readability`, `generic` (all-round), `vegetable-police` (guideline compliance; auto-skipped for repos without guideline files). Default: `generic`. If no review model covers `correctness` or `generic`, the bot starts with a warning (valid for specialized deployments). See [Review personas](#review-personas-roles). |
+| `MODEL1_ROLES` | Optional | Review personas this model runs, comma-separated (e.g. `security,correctness`). The model runs the review pass **once per role**, each with a role-focused prompt. Allowed: `correctness`, `security`, `readability`, `generic` (all-round), `vegetable-police` (guideline compliance; auto-skipped for repos without guideline files), `ai-generated-code` (hunts bugs typical of LLM-authored code: hallucinated APIs, tests that mirror the implementation instead of checking behavior, confident-looking-but-wrong logic). Default: `generic`. If no review model covers `correctness` or `generic`, the bot starts with a warning (valid for specialized deployments). See [Review personas](#review-personas-roles). |
 | `MODEL1_VALIDATE` | Optional | Set `false` to exclude this model from the validator pool (defaults to `true`). Use for review-only deployments whose endpoint doesn't speak `/chat/completions` — e.g. Azure responses-API codex models — so the bot doesn't try to vote with them and 400. |
-| `MODEL1_PROVIDER` | When `MODEL1_REVIEW=true` | pi-runner provider — must match the model. Supported: `anthropic`, `google` (Gemini), `openai`, `azure-openai-responses`, `openrouter`, `xai`, `deepseek`, `mistral`, `groq`. The key is forwarded to pi under that provider's env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, …). Defaults to `azure-openai-responses` — a Claude/Gemini model left on that default returns a 404. |
+| `MODEL1_PROVIDER` | When `MODEL1_REVIEW=true` | pi-runner provider — must match the model. Supported: `anthropic`, `google` (Gemini), `google-vertex`, `openai`, `azure-openai-responses`, `openrouter`, `xai`, `deepseek`, `mistral`, `groq`. The key is forwarded to pi under that provider's env var (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, …). Defaults to `azure-openai-responses` — a Claude/Gemini model left on that default returns a 404. |
 | `MODEL1_DOCKER_IMAGE` | When `MODEL1_REVIEW=true` | Docker image for the pi-runner container (e.g. `lgr-pi-runner:latest`) |
 | `MODEL1_TIMEOUT_MS` | When `MODEL1_REVIEW=true` | Timeout in milliseconds for the pi-runner container |
-| `MODEL2_*` … `MODEL4_*` | Optional | Same fields for Model 2, 3, and 4 |
+| `MODEL2_*` … `MODEL5_*` | Optional | Same fields for Model 2, 3, 4, and 5 |
 | `REVIEW_MAX_DIFF_LINES` | Optional | Diffs larger than this line count are skipped (default: 5000) |
 | `REVIEW_MAX_FILE_LINES` | Optional | Files larger than this line count are skipped in review (default: 1000) |
 | `REVIEW_MAX_INFO_TOKENS` | Optional | Token budget for the info-gatherer's added context (DTOs / symbol matches). Roughly 4 chars per token. Set `0` to disable info-gathering. Default: 8000. |
 | `REVIEW_MAX_EXPLORATION_TOKENS` | Optional | Token budget for the pre-review context exploration pass (agentic loop, ≤ 3 rounds) whose result is attached as `context.md` to every reviewer run. Roughly 4 chars per token. Every reviewer run's input grows by up to this budget, so cost scales with the run count. Set `0` to disable exploration. Default: 50000. |
 | `REVIEW_MAX_VALIDATORS` | Optional | Cap on the number of validators that vote per PR. If more validator-enabled models are configured, a random subset of this size is picked per PR and reused across round 1, round 2, suggestion votes, and fix-prompt drafting. Set `0` for no cap. Default: 2. |
+| `REVIEW_SECURITY_SCANNERS_ENABLED` | Optional | Set `true` to run Semgrep (SAST) + gitleaks (secrets) against the PR's changes before review, attached as `scanner-findings.md` to security/generic persona runs. Default: `false`. |
+| `REVIEW_JUDGE_MODEL_SLOT` | Optional | Pins one model (`1`-`5`, matching `MODELn_*`) as the round-2 judge for contested findings (see [Multi-model review and validation](#multi-model-review-and-validation)). Must be a `MODELn_VALIDATE=true` model. `0` (default) uses whichever validator lands first in the per-PR random subset. |
+| `REVIEW_ALWAYS_JUDGE` | Optional | Set `true` to send every finding round 1 didn't unanimously reject through the round-2 judge, not just split votes. Default: `false`. |
+| `REVIEW_AUX_MODEL_SLOT` | Optional | Pins one model (`1`-`5`) to run the info-gatherer, context-explorer, and dedup passes — e.g. an unreliable local model. `0` (default) uses the first available validator. |
+| `REVIEW_AUX_FALLBACK_MODEL_SLOT` | Optional | Pins a fallback model, tried automatically when `REVIEW_AUX_MODEL_SLOT`'s model fails a call. `0` (default) means no fallback. |
+| `REVIEW_AUX_MAX_CONCURRENCY` | Optional | Cap on concurrent info-gather/dedup calls (one per file, otherwise unbounded). Lower it if the aux model is a local server that can't serve many requests at once — unbounded fan-out on a large PR will queue and time out every request. Default: 4. |
+| `IMPLEMENT_MODEL_SLOT` | Optional | Pins one review-enabled model (`1`-`5`, `MODELn_REVIEW=true`) to run pi for Jira ticket implementation (see [Flow 4](#flow-4-jira-tickets)). `0` (default) uses the first review-enabled model. |
 
-### Jira (optional ticket context)
+### Jira (optional: ticket context and ticket implementation)
 
 When configured, each review resolves the PR's originating Jira ticket — the key is parsed from the source branch name, then the PR title, then the PR description (first hit wins) — and attaches its summary, description, and the 10 most recent comments to every reviewer run inside `pr-context.md`, alongside the PR title/description. The discussion is included because that is where scope is renegotiated after the description was written ("we decided not to do X", "also needs Y"); reviewers are told to prefer it over the description where the two disagree. Comments are flattened from plain text or ADF, capped at 800 chars each and 4 KB for the section, and rendered oldest-first. Reading is the only operation performed; failures (Jira down, key not found) cost nothing but the ticket section.
 
@@ -68,6 +78,8 @@ When configured, each review resolves the PR's originating Jira ticket — the k
 | `JIRA_EMAIL` | Cloud only | Set together with an API token → Basic auth (`email:token`). Leave empty on Server/Data Center to use Bearer PAT auth instead. |
 | `JIRA_API_TOKEN` | With base URL | Cloud API token or Server/DC personal access token. |
 | `JIRA_PROJECT_KEYS` | Optional | Comma-separated allowlist of project keys (e.g. `ABC,CORE`). Without it any `KEY-123`-shaped string matches, with well-known non-tickets (`ISO-8601`, `SHA-256`, `RFC-…`, `CVE-…`) ignored. Set it if you see false matches. |
+
+For ticket implementation (Flow 4) the token additionally needs write access: add comments, edit the assignee, and (when `jiraDoneTransition` is set) transition issues. On Cloud that is the `write:jira-work` scope; on Server/DC the bot user needs Edit Issues, Assign Issues, Add Comments, and Transition Issues in the project's permission scheme. The bot user is whoever the token belongs to — assigning a ticket to that user is the trigger.
 
 ### Bitbucket Cloud (alternative to Server)
 
@@ -92,10 +104,33 @@ curl -s -u "$BITBUCKET_CLOUD_BOT_EMAIL:$BITBUCKET_CLOUD_ACCESS_TOKEN" https://ap
 
 The Cloud bot polls every repository in the workspace. Discovery is automatic — no per-repo configuration. The `.carrot.jsonc` file in each repo's default branch still gates whether the bot acts on it, exactly as on Server.
 
-### Running both providers side-by-side
+### Forgejo (third provider)
 
-Use the dedicated scripts in two separate processes, and give each instance its
-own state directory via `DATA_DIR` (default: `./data`). Both instances hold the
+To run against a Forgejo instance (for example `https://forgejo.example.com`), use `npm run start:forgejo` (Docker: `docker-compose.forge.yml`) and fill in:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `FORGEJO_BASE_URL` | For Forgejo | Instance URL, e.g. `https://forgejo.example.com`. A sub-path is allowed. |
+| `FORGEJO_TOKEN` | For Forgejo | Access token of the bot user. Scopes: `read:user`, `read:organization`, `write:repository`, `write:issue`. |
+| `FORGEJO_BOT_USERNAME` | For Forgejo | Login of the bot user. carrot recognises its own comments by this login, so use a dedicated bot user, not a person's account. |
+
+The bot polls every non-archived, non-mirror repository it can see: all repos of the orgs it belongs to and repos shared with it. `.carrot.jsonc` in each repo's default branch still gates whether the bot acts on it.
+
+Do not make the bot user a site admin: Forgejo shows admins other users' pending reviews.
+
+Repo setting: enable **Settings → Repository → "Delete pull request branch after merge by default"** in every repo that uses carrot. Forgejo cannot set this per PR, so carrot's fix, revert and ticket branches otherwise stay after merge. carrot never changes repo settings; it logs one warning per repo when the setting is off.
+
+How Forgejo differs from Bitbucket for carrot:
+
+- **One review per finding.** Forgejo accepts code comments only inside a review, so every inline finding is posted as its own small "comment" review. The PR timeline shows several "carrot reviewed" entries.
+- **Suggestions are not applicable.** Forgejo has no "apply suggestion" button. carrot labels the block "**Suggested change** (apply by hand)".
+- **Replies.** A reply to a code comment goes into the same conversation. A reply to a general comment is a new general comment that quotes the first line of the comment it answers. The quote shows the author in bold and does not re-ping anyone.
+- **Review summaries are not read.** `@carrot` written only in the summary text of a review (the box shown when you submit a review) is not seen. Write it as a code comment or a general comment.
+
+### Running several providers side-by-side
+
+Use the dedicated scripts in separate processes, and give each instance its
+own state directory via `DATA_DIR` (default: `./data`). All instances hold the
 whole state file in memory and rewrite it on every save, so sharing one
 `data/state.json` silently clobbers the other instance's review markers, retry
 counters, and mention watermarks. Pass `DATA_DIR` per process — setting it in
@@ -104,6 +139,7 @@ the shared `.env` would give both instances the same value again:
 ```bash
 npm run start:server                        # talks to BITBUCKET_*, uses ./data
 DATA_DIR=./data-cloud npm run start:cloud   # talks to BITBUCKET_CLOUD_*, uses ./data-cloud
+DATA_DIR=./data-forge npm run start:forgejo # talks to FORGEJO_*, uses ./data-forge
 ```
 
 The default `npm run start` / `npm run start:production` / `npm run start:development` continue to point at the Server entrypoint for back-compat.
@@ -121,29 +157,33 @@ npm run build && npm run start:production
 ### Docker
 
 ```bash
-docker-compose build
-docker-compose up -d
+docker compose build
+docker compose up -d
 ```
 
-The `docker-compose.yml` includes an `init-perms` service that fixes `data/` and `repos/` ownership. If switching between local dev and Docker:
+The `docker-compose.yml` includes an `init-perms` service that fixes `data/`, `repos/`, and `tmp/` ownership. If switching between local dev and Docker:
 
 ```bash
-./tools/fix-data-perms.sh docker   # before docker-compose up
+./tools/fix-data-perms.sh docker   # before docker compose up
 ./tools/fix-data-perms.sh local    # before npm run start
 ```
 
-To run a Cloud bot in Docker alongside (or instead of) the Server bot, copy the existing service in `docker-compose.yml` and override the command:
+**How pi runs from inside the container.** The bot starts pi (and the repo lint step) with `docker run` and builds the `lgr-pi-runner` image with `docker build`. It never uses the host's Docker daemon for that: the compose stack has a **Docker-in-Docker** service (`dind`) that is the bot's private daemon, reached over the compose network via `DOCKER_HOST=tcp://dind:2375`. The app image ships the Docker CLI for this. Consequences:
 
-```yaml
-local-git-reviewer-cloud:
-  extends: local-git-reviewer
-  environment:
-    - BITBUCKET_CLOUD_WORKSPACE=${BITBUCKET_CLOUD_WORKSPACE}
-    - BITBUCKET_CLOUD_ACCESS_TOKEN=${BITBUCKET_CLOUD_ACCESS_TOKEN}
-    - BITBUCKET_CLOUD_BOT_USERNAME=${BITBUCKET_CLOUD_BOT_USERNAME}
-    - BITBUCKET_CLOUD_BOT_EMAIL=${BITBUCKET_CLOUD_BOT_EMAIL}
-  command: ["node", "dist/src/main-cloud.js"]
+- **Everything stays in the instance directory.** `dind` stores its images in `./docker`, next to `./data`, `./repos` and `./tmp`. Nothing lands under `/var/lib/docker` on the host, and the host user needs no docker group, no packages and no root. `dind` runs `privileged`, which Docker-in-Docker requires; its port is not published.
+- **Same paths in three places.** The `dind` daemon resolves every `-v <path>` of a pi run inside *its* container, so the repo clones and the bot's temp workspaces must have the same absolute path on the host, in the bot container and in the `dind` container. `docker-compose.yml` mounts `${PWD}/repos` and `${PWD}/tmp` into both containers at identical paths and points the bot at them via `WORK_DIR` and `TMPDIR`. Run `docker compose` from the instance directory, because `${PWD}` is that directory.
+- **Per-instance temp root.** The bot scopes its temp dirs by process id. Two instances on one host both run their bot as pid 1, so each instance needs its own `tmp/` — which the `${PWD}/tmp` mount gives it.
+- **Disk.** Budget for the `./docker` directory: the `lgr-pi-runner` image (one per pi release), one derived image per repo `dockerImage`, and the base images they pull. Old pi-runner tags are not pruned automatically.
+
+To run a Cloud bot alongside (or instead of) the Server bot, use `docker-compose.cloud.yml` as an override on top of the base file — it swaps in the cloud entrypoint (`main-cloud.js`):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cloud.yml up -d
 ```
+
+Production runs this as **three separate deployments** from the same images — a `server` instance, a `cloud` instance and a `forge` instance, each with its own directory (and so its own `data/`/`repos/`), the cloud one adding the override above and the forge one adding `docker-compose.forge.yml`. See `.forgejo/workflows/deploy.yml` for exactly how (it deploys all of them on every push to `main`).
+
+The `forge` instance works the same way with `docker-compose.forge.yml`. Before its first deploy, create `${DEPLOY_PATH}/forge/` on the host with its own `.env` (the `FORGEJO_*`, model and Jira variables) and empty `data/`, `repos/`, `tmp/` and `docker/` directories; otherwise the `forge` deploy leg fails.
 
 ### Reset state
 
@@ -180,28 +220,9 @@ npm run test:watch    # Watch mode
 npm run ci:test       # CI (same as npm test)
 ```
 
-28 test files via Vitest.
+42 test files via Vitest.
 
-## Pushing changes / remotes
-
-This repo is pushed to two GitHub remotes:
-
-| Remote | URL | Purpose |
-|--------|-----|---------|
-| `origin` | `github.com/Nkay/local-git-reviewer` | working remote (upstream of `public-main`) |
-| `public` | `github.com/chax-at/local-review-agent` | chax-at published mirror |
-
-Work happens on the local `public-main` branch. To publish it to the chax-at repo's `main`:
-
-```bash
-git push public public-main:main
-```
-
-To push to the working `origin` remote:
-
-```bash
-git push origin public-main
-```
+## Pushing changes
 
 ### Pre-push hook (Windows / WSL note)
 
@@ -220,6 +241,11 @@ A single polling loop runs on a configurable interval (default: 5 minutes). Each
 ```
 ┌────────────────────────────────────────────────┐
 │            Poll cycle (single timer)           │
+│                                                │
+│  Ticket phase (TicketService)                  │
+│     - Query Jira for tickets assigned to bot   │
+│     - Implement with pi, validate, open PR     │
+│     - Comment on ticket, assign back           │
 │                                                │
 │  PR phase (PollerService)                      │
 │     - Discover repos                           │
@@ -256,7 +282,14 @@ A single polling loop runs on a configurable interval (default: 5 minutes). Each
 | `src/reviewer/info-gatherer.ts` | Per-file context expansion (extra files / symbol search) for validators |
 | `src/reviewer/context-explorer.ts` | Pre-review agentic exploration pass; produces the `context.md` shared by all reviewer runs |
 | `src/reviewer/pr-context.ts` | Assembles `pr-context.md` (PR title/description + Jira ticket) for reviewer runs |
-| `src/jira/jira.service.ts` | Read-only Jira client + ticket-key extraction from branch/title/description |
+| `src/reviewer/fix-loop.ts` | Council fix-validation loop and lint helper shared by PR fixes and ticket runs |
+| `src/jira/jira.service.ts` | Jira client: ticket read for review context, plus search/comment/assign/transition for Flow 4 |
+| `src/jira/jira-identity.ts` | Jira user identity, mention detection, assignment history parsing |
+| `src/tickets/ticket.service.ts` | Flow 4: Jira tickets assigned to the bot → pi implementation → PR → hand-back |
+| `src/tickets/ticket-mode.ts` | Fresh / continue / skip decision from mentions and assignment time |
+| `src/tickets/ticket-repo-map.ts` | Jira project key → repo map from `.carrot.jsonc`, LLM repo picker for ambiguous keys |
+| `src/tickets/ticket-branch.ts` | `feature/KEY-123-slug` naming and existing-branch lookup |
+| `src/tickets/ticket-prompt.ts` | Builds `ticket.md` for the pi implementation run |
 | `src/reviewer/llm-client.ts` | OpenAI-compatible API wrapper |
 | `src/reviewer/llm-schemas.ts` | Zod schemas for structured LLM outputs |
 | `src/reviewer/diff.utils.ts` | Diff splitting, filtering, batching |
@@ -264,6 +297,7 @@ A single polling loop runs on a configurable interval (default: 5 minutes). Each
 | `src/provider/bitbucket-cloud/cloud.client.ts` | Bitbucket Cloud REST API wrapper |
 | `src/config/carrot-config.service.ts` | `.carrot.jsonc` discovery and parsing |
 | `src/constants.ts` | Bot branch prefixes, identity helpers |
+| `src/instrumentation/` | OpenTelemetry setup, tail sampling, metrics, root spans |
 
 ---
 
@@ -300,7 +334,14 @@ Commit a `.carrot.jsonc` file to the repo's **default branch**. The bot discover
 
   // Include LLM-generated fix prompts in review summaries and rejection comments.
   // Costs extra tokens per review. Default: false
-  "generateFixPrompts": true
+  "generateFixPrompts": true,
+
+  // Jira project keys whose tickets this repo implements when assigned to the bot (Flow 4).
+  // Default: none (ticket implementation off for this repo)
+  "jiraProjects": ["ABC", "CORE"],
+
+  // Jira transition to apply after a successful ticket run, matched by name. Default: none
+  "jiraDoneTransition": "In Review"
 }
 ```
 
@@ -322,6 +363,8 @@ interface ICarrotConfig {
   rulesFiles?: string[];           // Code standards files from target branch. Default: ["CLAUDE.md", "AGENTS.md"]
   generateFixPrompts?: boolean;    // LLM fix prompts in summaries. Default: false
   suggestCodeFixes?: boolean;      // Inline code suggestions on review comments. Default: true
+  jiraProjects?: string[];         // Jira project keys this repo implements (Flow 4). Default: none
+  jiraDoneTransition?: string;     // Jira transition after a ticket run. Default: none
 }
 
 Output valid JSONC. Only include fields I need — omit anything that matches the defaults.
@@ -357,14 +400,16 @@ PR Poller cycle
 See [End-to-end review workflow](#end-to-end-review-workflow) for the full stage-by-stage detail.
 
 **Decision gates:**
-- `.carrot.jsonc` must exist with `prReview: true`
+- `.carrot.jsonc` must exist with `prReview: true` **OR** the bot is explicitly listed as the PR's reviewer (a Bitbucket-native signal) — a repo with no `.carrot.jsonc` at all still gets that one PR auto-reviewed with built-in defaults, but never gets mention dispatch (that needs config this repo never supplied)
 - PR must not be a draft
 - PR branch must not start with `carrot/` (bot-created)
 - PR must not have been successfully reviewed before (and fewer than 3 failed auto-review attempts)
 
+On the final failed attempt, the failure comment gets an LLM-written plain-language explanation of what likely went wrong (when a failure-explainer model is configured — see `REVIEW_AUX_MODEL_SLOT`), instead of just the raw error.
+
 ### Flow 2: Mention commands (`@carrot`)
 
-**Trigger:** Comment or reply containing `@carrot` in a PR.
+**Trigger:** Comment or reply containing `@carrot` in a PR — **including on draft PRs** (only auto-review waits for a PR to leave draft; a mention works immediately).
 
 Tag `@carrot` in any PR comment. The bot understands natural language — no keywords needed. An LLM reads your message in context (the code, the thread, previous review findings) and decides the best action:
 
@@ -416,13 +461,49 @@ All fix PRs have `deleteSourceBranchOnMerge` enabled.
 7. Create carrot/autofix-{prId}-{ts} branch + PR
 ```
 
+### Flow 4: Jira tickets
+
+**Trigger:** A Jira ticket is assigned to the bot's Jira user (the account behind `JIRA_API_TOKEN`), and a repo's `.carrot.jsonc` lists the ticket's project key in `jiraProjects`.
+
+The ticket phase runs **before** the PR phase of each poll cycle, so the PR it opens gets its review in the same cycle.
+
+```
+Ticket phase
+├─ JQL: assignee = currentUser() AND statusCategory != Done      (max 50)
+├─ JQL: mentions of the bot on tickets NOT assigned to it         (max 50, last 2 days)
+│    └─ one reply: "I only work on tickets that are assigned to me." — no work
+└─ For each assigned ticket whose project key a repo claims:
+   ├─ Decide mode: new @carrot comment → continue; new assignment → fresh; else skip
+   ├─ Branch: feature/KEY-123-<slug of summary, 40 chars>
+   │    fresh + branch exists → comment "Mention @carrot to continue", hand back, stop
+   ├─ Reset clone to default branch (fresh) or to the branch (continue)
+   ├─ pi implement with ticket.md (summary, description, last 10 comments, rules files)
+   ├─ Lint + pi lint-fix, then 3-round council validation
+   ├─ Safe stop: ticket no longer assigned to the bot → discard, comment, stop
+   ├─ Commit "feat(KEY-123): summary", push, open PR to default branch (or comment on the open one)
+   └─ Jira comment (branch, PR, summary, cost), assign back to whoever assigned it, optional transition
+```
+
+**Rules:**
+- The bot works only on tickets assigned to it. **Unassign the ticket to stop it** — it checks again right before pushing.
+- The mention query only gets a reply for a ticket whose project key one of this instance's repos claims; a mention on an unclaimed project key gets no reply.
+- If the bot cannot re-read the ticket for that check, it does not push, and the run counts as a failed attempt.
+- A ticket runs once per assignment. To run again: mention `@carrot` in a ticket comment (continues on the existing branch, comment text becomes an extra instruction) or assign it to the bot again.
+- Two repos claiming the same project key: an LLM picks one from the ticket text; if unsure, the bot lists the candidates in a comment and hands the ticket back.
+- A failing run is retried next cycle, at most 3 attempts, then the bot comments the error and hands the ticket back.
+- Which model implements: `IMPLEMENT_MODEL_SLOT` (a review-enabled model; default: the first one).
+
+**Running several instances (server, cloud, forge) on one host:** all of them query the same Jira. One Jira project key must be claimed by repos of **one** instance only — the bot can not detect a key claimed on more than one, and each of them would run the ticket. This matters during a migration: while a repo exists both on Bitbucket and on Forgejo, keep `jiraProjects` in the `.carrot.jsonc` of only one copy.
+
+**State:** `tickets` map in `data/state.json` (branch, PR, attempts, comment watermark, last run time).
+
 ---
 
 ## Multi-model review and validation
 
-The bot supports four general-purpose models (`Model1`–`Model4`). Each model is by default a **validator**; setting `MODELn_REVIEW=true` additionally enrolls it in the **review** pool (which runs the Docker pi-runner). The first validator-enabled model also doubles as the **context explorer** (pre-review) and the **info-gatherer**.
+The bot supports five general-purpose models (`Model1`–`Model5`). Each model is by default a **validator**; setting `MODELn_REVIEW=true` additionally enrolls it in the **review** pool (which runs the Docker pi-runner). The first validator-enabled model also doubles as the **context explorer** (pre-review) and the **info-gatherer**, unless `REVIEW_AUX_MODEL_SLOT` pins a different one. Info-gather and dedup call this model once per file, in parallel, up to `REVIEW_AUX_MAX_CONCURRENCY` (default 4) at a time — lower it if the aux model is a local server that can't serve that many requests at once, or its requests will queue up and time out.
 
-**Every `MODELn_REVIEW=true` model runs on each PR** (see [Review personas](#review-personas-roles) for how each model's roles expand into runs). **Validators** are capped at `REVIEW_MAX_VALIDATORS` (default 2; set `0` for no cap): if more validator-enabled models are configured, a random subset of that size votes per PR — different PRs may see different validators, giving cost-bounded diversity. Within a single PR the picked validator subset is stable: round 1, round 2, suggestion votes, and fix-prompt drafting all see the same validators.
+**Every `MODELn_REVIEW=true` model runs on each PR** (see [Review personas](#review-personas-roles) for how each model's roles expand into runs). **Validators** are capped at `REVIEW_MAX_VALIDATORS` (default 2; set `0` for no cap): if more validator-enabled models are configured, a random subset of that size votes per PR — different PRs may see different validators, giving cost-bounded diversity. Within a single PR the picked validator subset is stable: round 1, round 2, suggestion votes, and fix-prompt drafting all see the same validators. Findings the council splits on get a second look from one **judge** model — pinned by `REVIEW_JUDGE_MODEL_SLOT`, or the first available validator by default — which decides using pi's evidence from checking the finding against the real code (see [Stage 8c](#end-to-end-review-workflow)).
 
 ### Review personas (roles)
 
@@ -435,6 +516,7 @@ Each review model is assigned one or more **roles** via `MODELn_ROLES` (comma-se
 | `readability` | Naming, dead code, duplication, unclear intent, code-standard violations |
 | `generic` | All-round review (the original single-prompt behavior) |
 | `vegetable-police` | Compliance with the repo's own guideline files for agents/reviewers (CLAUDE.md / AGENTS.md / carrot `rulesFiles`, i.e. exactly what `standards.md` carries). Flags every diff change that violates a written rule and cites the rule. **Runs only when the repo actually has guideline files** — with none to enforce, the run is skipped (per PR, logged, no cost). |
+| `ai-generated-code` | Bugs typical of LLM-authored code: hallucinated APIs/imports, tests that mirror the implementation instead of checking behavior, confident-looking-but-wrong logic, and overly generic error handling that silently swallows real failures. |
 
 So the number of review pi-runs per PR is the **sum of roles across all review models** — two models with two roles each is four runs. Every review-enabled model runs every PR (there is no reviewer cap), so keep role lists modest to bound cost. Findings are tagged with both the authoring model and the role that produced them, and flow into the same dedup + validation pipeline. At startup the bot validates every role string — unknown or duplicate roles fail fast. If no review model covers `correctness` (an explicit `correctness` role, or any `generic` model) the bot still starts but logs a warning, since a council that can't catch bugs is usually a misconfiguration — running that way deliberately (e.g. a guidelines-only `vegetable-police` deployment) is a supported operator choice.
 
@@ -485,7 +567,7 @@ Each PR review walks through nine stages. Every stage is best-effort: if a stage
 - The LLM returns `{actions: [{type: 'file'|'search', target: '<path or symbol>'}, …]}`. Actions are executed: `file` actions go through `provider.getFileContent`, `search` actions run `execFileSync('git', ['grep', ...])` against the (now-reset) working tree.
 - Each file's results are accumulated into a markdown blob, capped at `REVIEW_MAX_INFO_TOKENS × 4` chars **per file** (≈ 32 KB default), with a per-block ceiling of 16 KB so one huge file can't eat the whole budget.
 - Result: `additionalContextByFile: Map<filePath, string>`. Each file's blob is injected only into that file's validator group prompt later — no cross-file contamination.
-- The info-gatherer model is `validators[0]` — the first `MODELn_VALIDATE`-enabled model, which is also the deduplicator; re-order your validators to use a cheaper model in these roles. If no validator exists or `REVIEW_MAX_INFO_TOKENS=0`, the stage is a no-op and the pipeline carries on with no extra context.
+- The info-gatherer model is the **aux model** — the first `MODELn_VALIDATE`-enabled model by default, or the one pinned by `REVIEW_AUX_MODEL_SLOT` — which also runs the context explorer, dedup, and failure-explainer. `REVIEW_AUX_FALLBACK_MODEL_SLOT` pins a fallback tried on failure (e.g. a local model backed by a reliable cloud one), and `REVIEW_AUX_MAX_CONCURRENCY` bounds how many per-file calls run at once. If no validator exists or `REVIEW_MAX_INFO_TOKENS=0`, the stage is a no-op and the pipeline carries on with no extra context.
 
 **Stage 8a — Validation, round 1.** Findings are split into per-file groups. The active validator pool ([chosen per PR](#multi-model-review-and-validation)) **deprioritizes this PR's finding authors**: a model can't vote on findings it (co-)authored, so sampling a reviewer would waste a validator slot — authors are only sampled when there aren't enough non-author validators to fill the subset. For each group, **every active model except the finding's author(s)** is asked to vote (for merged findings, all `contributingAuthors` are excluded).
 - The model returns `{results: [{index, relevant, thought, infoRequest}, …]}`. The `infoRequest` field (free text — a specific path or symbol) flags "I'd need more context to judge this confidently".
@@ -502,9 +584,10 @@ Each PR review walks through nine stages. Every stage is best-effort: if a stage
 - New per-file blobs are merged into the existing `additionalContextByFile` (concatenated, not replaced), so round 2 sees both the proactive context and the new follow-up context.
 - Failure here degrades silently: round 2 just runs with whatever context already existed.
 
-**Stage 8c — Validation, round 2 (deliberation).** Contested findings are re-asked, this time each model also sees **every peer's round-1 reasoning**. Same author-exclusion. Schema is the base `FindingsValidationSchema` (no `infoRequest` — info-gathering is done by this point).
-- A finding is discarded only if every responding round-2 voter rejects it; any defender keeps it. This is intentionally biased toward keeping signal.
-- All vote entries (round 1 + round 2, every model) are rendered into the final inline comment as a "Valid finding / Not important" block under each finding, so the human reader can see the disagreement.
+**Stage 8c — Validation, round 2.** Contested findings are settled one of two ways:
+- **Pi-grounded judge (the actual path whenever any review-enabled model exists).** Pi — run under the first review-enabled model, `reviewModels[0]`, not separately configurable — checks each contested finding directly against the real code (read + bash tools, repo mounted read-only — it verifies, never edits) and returns supporting evidence. One judge model — pinned by `REVIEW_JUDGE_MODEL_SLOT`, or the first available validator by default, and not necessarily the same model that ran pi — then reads the finding, its round-1 votes, and pi's evidence, and decides directly: no revote, no unanimous-reject counting. Set `REVIEW_ALWAYS_JUDGE=true` to send every finding round 1 didn't unanimously reject through this judge, not just split votes. A finding the judge itself authored can't be judged independently (no other single judge to ask) and is conservatively kept. The rendered notes show both: `**pi (<model that ran it>) verified against the code:** <evidence>` then `**<judge name> says:** <reasoning>`.
+- **Plain deliberation (fallback, no pi evidence available).** Contested findings are re-asked, this time each model also sees **every peer's round-1 reasoning**. Same author-exclusion. A finding is discarded only if every responding round-2 voter rejects it; any defender keeps it — intentionally biased toward keeping signal.
+- All vote entries (round 1 + round 2, every model) are rendered into the final inline comment as a "Valid finding / Not important" block under each finding, so the human reader can see the disagreement either way.
 
 **Stage 9 — Code suggestions.** For every kept finding, the primary review model's pi-runner is asked to `proposeFixes`. Replace-proposals go through the same 2-round council vote (`validateSuggestions`). Approved suggestions are attached to the inline comment as ```suggestion blocks; rejected ones are silently dropped.
 
@@ -516,7 +599,7 @@ The PR summary comment carries: severity counts, skipped files, optional fix-pro
 
 | Failure mode | Behavior |
 |--------------|----------|
-| All review models fail | "Automated review failed" comment posted (no false-positive "no issues"). Auto-review retries next cycle, **at most 3 attempts total**, then gives up (a `@mention` review still works). |
+| All review models fail | "Automated review failed" comment posted (no false-positive "no issues"). Auto-review retries next cycle, **at most 3 attempts total**, then gives up (a `@mention` review still works). On the final attempt the comment also gets a plain-language explanation from the failure-explainer model, when one is configured. |
 | One review model fails | Other models' findings are still pooled. |
 | Provider can't fetch a file | That file's findings move to a fallback diff-only group instead of a whole-file group. |
 | Dedup LLM throws / returns garbage | That file's findings stay unmerged — never dropped. |
@@ -529,12 +612,14 @@ The PR summary comment carries: severity counts, skipped files, optional fix-pro
 | Repo has no guideline files (`vegetable-police` configured) | Police runs are skipped for that PR (logged, no cost); other roles run normally. If *every* configured run is guideline-dependent, the review is skipped entirely. |
 | Info-gatherer LLM throws | Caught, logged, pipeline continues with empty context. |
 | Info-gatherer returns unparseable JSON | Caught, usage still counted, empty context. |
-| One per-file gather/dedup call hangs/throws | Others still complete (`Promise.allSettled` isolation). |
+| One per-file gather/dedup call hangs/throws | Others still complete — bounded by `REVIEW_AUX_MAX_CONCURRENCY`, not run all at once. |
 | `git grep` finds nothing | Returns empty hits (exit code 1 is treated as "no matches", not failure). |
 | Validator omits `infoRequest` field | Lenient fallback parse — vote still counted. |
 | Validator returns malformed JSON | That model abstains for that group; other models still vote. |
 | All validators abstain on a finding | Conservatively kept (no false-discard). |
 | Follow-up gather throws | Round 2 falls back to the original `additionalContextByFile`. |
+| Pi verification (round-2 judge) throws | Judge decides on round-1 votes alone, with no code evidence. |
+| Judge returns unparseable JSON, or the call itself fails | That group's findings are kept conservatively (no false-discard). |
 | One inline comment fails to post | Skipped (logged); the rest still post; review state is saved. |
 | ALL inline comments fail to post | Run throws → state not saved → full retry next cycle (cannot duplicate, nothing was posted). Counts toward the 3-attempt cap. |
 | Summary comment fails to post | Logged, non-fatal — inline comments are already out and state gets saved. |
@@ -561,7 +646,7 @@ Where the money goes, and what bounds it:
 Remaining caveats:
 
 - **Cost scales with file count.** With N finding-files in a PR, dedup + proactive gather + follow-up are each up to N calls. There is no single global per-PR token cap — the bounds above are per-call. To cap aggressively, lower `REVIEW_MAX_INFO_TOKENS` (or set `0`), keep role lists short (each role is a pi-run), and keep `REVIEW_MAX_VALIDATORS` at 2.
-- **Parallel fan-out has no concurrency limit.** Per-file dedup and gather calls all fire at once; a 50-file PR makes 50 concurrent LLM requests. That's a rate-limit risk (429s degrade gracefully to "no result"), not a cost risk.
+- **Parallel fan-out is capped by `REVIEW_AUX_MAX_CONCURRENCY`** (default 4). Per-file dedup and gather calls run in parallel up to that cap, not all at once — a 50-file PR makes at most 4 concurrent LLM requests, cycling through the rest. Raise it for a cloud aux model with room to spare; a too-high value against a low-concurrency local model server queues requests until they hit the client timeout.
 - **Working-tree assumption.** `git grep` operates on the local clone's working tree, which is reset to the source branch before each review. The pipeline assumes review and fix flows for the same `(project, slug)` are **serialized** (the existing pollers enforce this). Concurrent flows on the same local repo would race on the working tree.
 - **`infoRequest` is free text.** Vague requests ("more context please") produce nothing useful. The round-1 prompt nudges validators toward specific paths or symbols, but model behavior here is best-effort, not enforced.
 - **One info-gathering follow-up round.** Round 2 does not re-trigger another gather. If the round-2 LLMs need yet more context, they can't ask for it.
@@ -581,6 +666,12 @@ OpenAI-compatible base URLs for common providers (these satisfy the validator, w
 | `google` (Gemini) | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `azure-openai-responses` | `https://<resource>.openai.azure.com/openai/v1` | `AZURE_OPENAI_API_KEY` |
+| `openrouter` | *(see provider's docs)* | `OPENROUTER_API_KEY` |
+| `xai` | *(see provider's docs)* | `XAI_API_KEY` |
+| `deepseek` | *(see provider's docs)* | `DEEPSEEK_API_KEY` |
+| `mistral` | *(see provider's docs)* | `MISTRAL_API_KEY` |
+| `groq` | *(see provider's docs)* | `GROQ_API_KEY` |
+| `google-vertex` | *(see provider's docs)* | `GOOGLE_CLOUD_API_KEY` |
 
 The single `MODELn_API_KEY` you set serves both paths (forwarded to pi under the provider's key env var automatically). Azure OpenAI also needs `MODELn_AUTH_HEADER=api-key` + `MODELn_MAX_TOKEN_PARAM=max_tokens`. Models that do not support `json_schema` response format can use `MODELn_SUPPORTS_STRUCTURED_OUTPUT=false` (falls back to prompt-only JSON; the validator's lenient parse handles the missing `infoRequest` field automatically).
 
@@ -628,10 +719,11 @@ The bot must never trigger itself. These mechanisms ensure that:
     "PROJECT/slug": {
       pullRequests: {
         "123": {
-          lastReviewedCommit: "abc123",
+          lastReviewedCommit: "abc123",  // "" while auto-review attempts are still failing
           lastCheckedAt: "2026-03-23T...",
           lastActivityId: 47500,
-          processedMentionIds: [9405, ...]  // max 200
+          processedMentionIds: [9405, ...],  // max 200
+          reviewFailures: 0                  // consecutive auto-review failures; see MAX_AUTO_REVIEW_ATTEMPTS
         }
       }
     }
@@ -676,6 +768,24 @@ Debug logging is controlled by `Diagnostics.DebugLogs`:
 - **Off** in production (default)
 - **On** in development (`NODE_ENV=development`)
 - Override: `DIAGNOSTICS_DEBUG_LOGS=true`
+
+## Telemetry (OpenTelemetry)
+
+The bot can send traces, metrics and logs over OTLP/HTTP (protobuf). It is off by default.
+
+| Variable | Description |
+|----------|-------------|
+| `DIAGNOSTICS_OPENTELEMETRY_ENABLED` | `true` turns it on (default `false`) |
+| `DIAGNOSTICS_OPENTELEMETRY_ENDPOINT` | Collector base URL; the bot appends `/v1/traces`, `/v1/metrics`, `/v1/logs`. Required when telemetry is on; the bot exits when it is empty |
+| `DIAGNOSTICS_OPENTELEMETRY_TENANTID` | Sent as `X-Scope-OrgID` header and `vm_account_id` resource attribute (default `50`) |
+| `DIAGNOSTICS_OPENTELEMETRY_TRACESAMPLERATIO` | Share of the traces without an error that are exported; traces with an error are always exported (default `0.1`) |
+| `DIAGNOSTICS_OPENTELEMETRY_METRICSEXPORTINTERVALSECONDS` | Metric export interval (default `60`) |
+| `APP_NAME` / `APP_ENVIRONMENT` | `service.name` (default `local-git-reviewer`) and `deployment.environment` (default `local`) |
+| `RELEASE` | `service.version` (default `unknown`) |
+
+- **Traces:** each poll cycle, PR review, PR mention and Jira ticket run is a trace of its own, linked to the poll cycle that started it. Child spans: every HTTP call (Bitbucket, Forgejo, Jira, LLM APIs) and every pi Docker run.
+- **Metrics:** `local_git_reviewer.error.count` (every logged error, by log tag), `local_git_reviewer.review.count` and `local_git_reviewer.review.duration` (by outcome `reviewed` / `skipped` / `failed`), `local_git_reviewer.llm.token.count` and `local_git_reviewer.llm.cost` (EUR, by model, the numbers of the comment footers), plus the HTTP client metrics.
+- **Logs:** all log levels down to info (debug when `DIAGNOSTICS_DEBUG_LOGS=true`).
 
 ## Identity
 

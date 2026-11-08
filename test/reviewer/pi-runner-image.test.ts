@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import { describe, it, expect } from 'vitest';
 import { buildPiRunnerImageArgs, derivedTagForBase } from '../../src/reviewer/pi-runner-image';
 
@@ -57,5 +58,29 @@ describe('derivedTagForBase', () => {
     const a = derivedTagForBase('node:lts-slim', '0.1.7');
     const b = derivedTagForBase('node:lts-slim', '0.1.8');
     expect(a).not.toBe(b);
+  });
+});
+
+describe('tools/pi-runner.Dockerfile', () => {
+  const dockerfile = fs.readFileSync(new URL('../../tools/pi-runner.Dockerfile', import.meta.url), 'utf-8');
+  const stages = dockerfile.split(/^FROM /m).slice(1);
+
+  it('has an installer stage and a base stage', () => {
+    expect(stages).toHaveLength(2);
+    expect(stages[0]).toMatch(/^\$\{NODE_IMAGE\} AS pi/);
+    expect(stages[1]).toMatch(/^\$\{BASE_IMAGE\}/);
+  });
+
+  // A per-repo base image (php:8.3-cli, python:3.12, ...) ships no npm, so an
+  // npm command in the base stage fails the build with `npm: not found`.
+  it('never runs npm in the base-image stage', () => {
+    expect(stages[1]).not.toMatch(/\bnpm\b/);
+  });
+
+  it('copies the self-contained pi prefix into the base image and puts it on PATH', () => {
+    expect(stages[0]).toMatch(/npm install -g --prefix \/opt\/pi @mariozechner\/pi-coding-agent@\$\{PI_AGENT_VERSION\}/);
+    expect(stages[0]).toMatch(/cp \/usr\/local\/bin\/node \/opt\/pi\/bin\/node/);
+    expect(stages[1]).toMatch(/COPY --from=pi \/opt\/pi \/opt\/pi/);
+    expect(stages[1]).toMatch(/ENV PATH=\/opt\/pi\/bin:\$PATH/);
   });
 });

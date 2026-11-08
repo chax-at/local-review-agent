@@ -99,6 +99,144 @@ describe('JiraService', () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  describe('ticket-flow calls', () => {
+    const bot = { accountId: '712020:bot', displayName: 'Carrot Bot' };
+
+    it('getMyself reads /rest/api/2/myself into an IJiraUser', async () => {
+      mockFetch.mockResolvedValueOnce(okResponse({ accountId: '712020:bot', displayName: 'Carrot Bot' }));
+      const jira = new JiraService('https://j.example.com', 'bot@x.at', 't', []);
+      expect(await jira.getMyself()).toEqual(bot);
+      expect(mockFetch.mock.calls[0][0]).toBe('https://j.example.com/rest/api/2/myself');
+    });
+
+    it('searchIssues uses /search/jql on Cloud and /search on Server, returns keys', async () => {
+      mockFetch.mockResolvedValueOnce(okResponse({ issues: [{ key: 'ABC-1' }, { key: 'ABC-2' }] }));
+      const cloud = new JiraService('https://j.example.com', 'bot@x.at', 't', []);
+      expect(await cloud.searchIssues('assignee = currentUser()', 50)).toEqual(['ABC-1', 'ABC-2']);
+      const cloudUrl = mockFetch.mock.calls[0][0] as string;
+      expect(cloudUrl.startsWith('https://j.example.com/rest/api/2/search/jql?')).toBe(true);
+      expect(cloudUrl).toContain('maxResults=50');
+      expect(cloudUrl).toContain(encodeURIComponent('assignee = currentUser()'));
+
+      mockFetch.mockResolvedValueOnce(okResponse({ issues: [{ key: 'ABC-3' }] }));
+      const server = new JiraService('https://j.example.com', '', 'pat', []);
+      expect(await server.searchIssues('x', 10)).toEqual(['ABC-3']);
+      expect((mockFetch.mock.calls[1][0] as string).startsWith('https://j.example.com/rest/api/2/search?')).toBe(true);
+    });
+
+    it('searchIssues returns [] on HTTP error or throw', async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 400, text: async () => 'bad' } as unknown as Response);
+      const jira = new JiraService('https://j.example.com', '', 't', []);
+      expect(await jira.searchIssues('x', 5)).toEqual([]);
+      mockFetch.mockRejectedValueOnce(new TypeError('down'));
+      expect(await jira.searchIssues('x', 5)).toEqual([]);
+    });
+
+    it('getIssueForRun expands the changelog and returns comments, reporter, assignee, assignment', async () => {
+      mockFetch.mockResolvedValueOnce(
+        okResponse({
+          key: 'ABC-1',
+          fields: {
+            summary: 'Do it',
+            description: 'Details',
+            reporter: { accountId: 'rep', displayName: 'Rep' },
+            assignee: { accountId: '712020:bot', displayName: 'Carrot Bot' },
+            comment: {
+              comments: [
+                {
+                  id: '5',
+                  author: { accountId: 'u', displayName: 'U' },
+                  created: '2026-09-01T00:00:00.000+0000',
+                  body: 'hi @carrot',
+                },
+              ],
+            },
+          },
+          changelog: {
+            histories: [
+              {
+                created: '2026-09-01T00:00:00.000+0000',
+                author: { accountId: 'lead', displayName: 'Lead' },
+                items: [{ field: 'assignee', to: '712020:bot' }],
+              },
+            ],
+          },
+        }),
+      );
+      const jira = new JiraService('https://j.example.com', 'bot@x.at', 't', []);
+      const issue = await jira.getIssueForRun('ABC-1', bot);
+      expect(mockFetch.mock.calls[0][0]).toBe(
+        'https://j.example.com/rest/api/2/issue/ABC-1?expand=changelog&fields=summary,description,comment,reporter,assignee',
+      );
+      expect(issue?.summary).toBe('Do it');
+      expect(issue?.reporter).toEqual({ accountId: 'rep', displayName: 'Rep' });
+      expect(issue?.assignee).toEqual(bot);
+      expect(issue?.comments.map((c) => c.id)).toEqual([5]);
+      expect(issue?.assignment).toEqual({
+        assignedAt: '2026-09-01T00:00:00.000+0000',
+        assignedBy: { accountId: 'lead', displayName: 'Lead' },
+      });
+    });
+
+    it('addComment posts a plain string body and reports success', async () => {
+      mockFetch.mockResolvedValueOnce(okResponse({ id: '9' }));
+      const jira = new JiraService('https://j.example.com', '', 't', []);
+      expect(await jira.addComment('ABC-1', 'hello')).toBe(true);
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://j.example.com/rest/api/2/issue/ABC-1/comment');
+      expect(init.method).toBe('POST');
+      expect(JSON.parse(init.body)).toEqual({ body: 'hello' });
+    });
+
+    it('assign sends accountId on Cloud and name on Server, null to unassign', async () => {
+      mockFetch.mockResolvedValue({ ok: true, status: 204, json: async () => ({}) } as unknown as Response);
+      const cloud = new JiraService('https://j.example.com', 'bot@x.at', 't', []);
+      await cloud.assign('ABC-1', { accountId: 'lead', displayName: 'Lead' });
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body)).toEqual({ accountId: 'lead' });
+      expect(mockFetch.mock.calls[0][1].method).toBe('PUT');
+
+      const server = new JiraService('https://j.example.com', '', 'pat', []);
+      await server.assign('ABC-1', { name: 'lead', displayName: 'Lead' });
+      expect(JSON.parse(mockFetch.mock.calls[1][1].body)).toEqual({ name: 'lead' });
+      await server.assign('ABC-1', null);
+      expect(JSON.parse(mockFetch.mock.calls[2][1].body)).toEqual({ name: null });
+    });
+
+    it('getTransitions lists id+name; transition posts the id', async () => {
+      mockFetch.mockResolvedValueOnce(
+        okResponse({
+          transitions: [
+            { id: '31', name: 'In Review' },
+            { id: '41', name: 'Done' },
+          ],
+        }),
+      );
+      const jira = new JiraService('https://j.example.com', '', 't', []);
+      expect(await jira.getTransitions('ABC-1')).toEqual([
+        { id: '31', name: 'In Review' },
+        { id: '41', name: 'Done' },
+      ]);
+      mockFetch.mockResolvedValueOnce({ ok: true, status: 204, json: async () => ({}) } as unknown as Response);
+      expect(await jira.transition('ABC-1', '31')).toBe(true);
+      const [url, init] = mockFetch.mock.calls[1];
+      expect(url).toBe('https://j.example.com/rest/api/2/issue/ABC-1/transitions');
+      expect(JSON.parse(init.body)).toEqual({ transition: { id: '31' } });
+    });
+
+    it('issueUrl builds the browse link', () => {
+      const jira = new JiraService('https://j.example.com/', '', 't', []);
+      expect(jira.issueUrl('ABC-1')).toBe('https://j.example.com/browse/ABC-1');
+    });
+
+    it('write calls return false when disabled and never call fetch', async () => {
+      const jira = new JiraService('', '', '', []);
+      expect(await jira.addComment('ABC-1', 'x')).toBe(false);
+      expect(await jira.assign('ABC-1', null)).toBe(false);
+      expect(await jira.transition('ABC-1', '1')).toBe(false);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
   describe('http:// base URLs (undici drops Authorization on the http→https redirect)', () => {
     it('auto-upgrades an http:// *.atlassian.net base URL to https', async () => {
       const warnSpy = vi.spyOn(LogSink, 'warn').mockImplementation(() => {});

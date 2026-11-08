@@ -40,6 +40,7 @@ describe('server.mappers.toPullRequest', () => {
         repository: { slug: 'r', project: { key: 'P' } },
       },
       author: { user: { slug: 'alice' } },
+      reviewers: [{ user: { slug: 'bob' } }, { user: { slug: 'carol' } }],
     };
 
     expect(toPullRequest(wire)).toEqual({
@@ -54,6 +55,7 @@ describe('server.mappers.toPullRequest', () => {
       sourceCommit: 'abc123',
       targetBranch: 'main',
       authorUsername: 'alice',
+      reviewerUsernames: ['bob', 'carol'],
     });
   });
 
@@ -84,6 +86,7 @@ describe('server.mappers.toPullRequest', () => {
     expect(out.updatedAt).toBe(null);
     expect(out.isOpen).toBe(true);
     expect(out.description).toBe('');
+    expect(out.reviewerUsernames).toEqual([]);
   });
 });
 

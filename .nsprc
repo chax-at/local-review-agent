@@ -10,5 +10,17 @@
   "1113552": {
     "active": true,
     "notes": "Dev-only"
+  },
+  "1240992": {
+    "active": true,
+    "notes": "Dev-only (braces via nodemon/chokidar and fast-glob/micromatch); no fixed version exists (<=3.0.3 affected, 3.0.3 is latest)"
+  },
+  "1241332": {
+    "active": true,
+    "notes": "Dev-only (shell-quote via concurrently)"
+  },
+  "1241209": {
+    "active": true,
+    "notes": "Dev-only (source-map-js via vitest/vite/postcss)"
   }
 }

@@ -5,6 +5,8 @@ config/local-development.json
 repos/
 data/
 data-*/
+tmp/
+docker/
 *.log
 .idea/
 .worktrees/
@@ -23,3 +25,6 @@ data-*/
 .mcp.json
 .vscode
 .gitmodules
+
+# superpowers SDD scratch
+.superpowers/

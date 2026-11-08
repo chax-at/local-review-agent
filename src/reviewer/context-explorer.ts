@@ -1,6 +1,6 @@
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
-import type { LlmClient, ILlmResponse } from './llm-client';
+import { chatWithFallback, type LlmClient, type ILlmResponse } from './llm-client';
 import type { IModelUsage } from '../types';
 import { InfoActionsSchema, infoActionsJsonSchema, parseWithSchema } from './llm-schemas';
 import { CHARS_PER_TOKEN, MAX_BLOCK_CHARS, executeInfoAction, type IInfoTool } from './info-gatherer';
@@ -54,6 +54,8 @@ export class ContextExplorer {
   constructor(
     private readonly llm: LlmClient | null,
     private readonly maxExplorationTokens: number,
+    /** Tried when `llm` (e.g. an unreliable local model) fails a call. */
+    private readonly fallbackLlm: LlmClient | null = null,
   ) {}
 
   public get isEnabled(): boolean {
@@ -74,21 +76,24 @@ export class ContextExplorer {
 
     for (let round = 0; round < MAX_ROUNDS && used < charBudget; round++) {
       let response: ILlmResponse;
+      let servedBy: LlmClient;
       try {
-        response = await this.llm.chat(SYSTEM_PROMPT, this.buildUserMessage(diff, blocks, intent), {
+        const result = await chatWithFallback(this.llm, this.fallbackLlm, SYSTEM_PROMPT, this.buildUserMessage(diff, blocks, intent), {
           jsonMode: true,
           jsonSchema: infoActionsJsonSchema,
         });
+        response = result.response;
+        servedBy = result.servedBy;
       } catch (err) {
         LogSink.warn(`Context explorer ${this.llm.name} failed in round ${round + 1}: ${err}`, TraceTags.PI);
         break;
       }
-      usage.push(this.trackUsage(response));
+      usage.push(this.trackUsage(response, servedBy));
 
       const parsed = parseWithSchema(response.content, InfoActionsSchema);
       if (!parsed) {
         LogSink.warn(
-          `Context explorer ${this.llm.name} returned unparseable response in round ${round + 1}`,
+          `Context explorer ${servedBy.name} returned unparseable response in round ${round + 1}`,
           TraceTags.PI,
         );
         break;
@@ -131,13 +136,12 @@ export class ContextExplorer {
     return sections.join('\n\n');
   }
 
-  private trackUsage(response: ILlmResponse): IModelUsage {
-    const llm = this.llm!;
+  private trackUsage(response: ILlmResponse, servedBy: LlmClient): IModelUsage {
     const cost =
-      (response.inputTokens / 1_000_000) * llm.inputCostPer1M +
-      (response.outputTokens / 1_000_000) * llm.outputCostPer1M;
+      (response.inputTokens / 1_000_000) * servedBy.inputCostPer1M +
+      (response.outputTokens / 1_000_000) * servedBy.outputCostPer1M;
     return {
-      modelName: `${llm.name} (exploration)`,
+      modelName: `${servedBy.name} (exploration)`,
       inputTokens: response.inputTokens,
       outputTokens: response.outputTokens,
       costEur: cost,

@@ -11,16 +11,16 @@
 set -eu
 
 mode="${1:-}"
-mkdir -p data repos
+mkdir -p data repos tmp
 
 case "$mode" in
   docker)
-    sudo chown -R 33:33 data repos
-    echo "data/ and repos/ now owned by uid 33 (www-data) — ready for Docker."
+    sudo chown -R 33:33 data repos tmp
+    echo "data/, repos/ and tmp/ now owned by uid 33 (www-data) — ready for Docker."
     ;;
   local)
-    sudo chown -R "$(id -u):$(id -g)" data repos
-    echo "data/ and repos/ now owned by $(id -un) — ready for local dev."
+    sudo chown -R "$(id -u):$(id -g)" data repos tmp
+    echo "data/, repos/ and tmp/ now owned by $(id -un) — ready for local dev."
     ;;
   *)
     echo "Usage: $0 {docker|local}" >&2

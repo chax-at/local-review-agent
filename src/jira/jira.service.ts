@@ -1,5 +1,13 @@
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
+import {
+  extractPlainText,
+  findLatestAssignmentToBot,
+  parseJiraUser,
+  parseRawComments,
+  type IJiraRawComment,
+  type IJiraUser,
+} from './jira-identity';
 
 export interface IJiraComment {
   author: string;
@@ -14,6 +22,19 @@ export interface IJiraTicket {
   description: string;
   /** Newest comments, oldest-first for reading. Absent when the ticket has none. */
   comments?: IJiraComment[];
+}
+
+/** Everything the ticket flow needs from one issue fetch (with changelog). */
+export interface IJiraIssueForRun {
+  key: string;
+  summary: string;
+  description: string;
+  reporter: IJiraUser | null;
+  assignee: IJiraUser | null;
+  /** All comments the API embedded, ascending by id. */
+  comments: IJiraRawComment[];
+  /** Newest assignment to the bot, or null when the changelog shows none. */
+  assignment: { assignedAt: string; assignedBy: IJiraUser | null } | null;
 }
 
 /** How many of the ticket's most recent comments to carry into the review. */
@@ -63,28 +84,6 @@ export function extractTicketKey(candidates: Array<string | null | undefined>, p
     }
   }
   return null;
-}
-
-/**
- * Jira issues live on a different API v2/v3 shape per deployment; some
- * instances hand back an ADF document instead of the v2 plain string. Flatten
- * whatever arrives into plain text, defensively.
- */
-function extractPlainText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (!value || typeof value !== 'object') return '';
-  const parts: string[] = [];
-  const walk = (node: unknown): void => {
-    if (!node || typeof node !== 'object') return;
-    const n = node as { text?: unknown; content?: unknown; type?: unknown };
-    if (typeof n.text === 'string') parts.push(n.text);
-    if (Array.isArray(n.content)) {
-      n.content.forEach(walk);
-      if (n.type === 'paragraph') parts.push('\n');
-    }
-  };
-  walk(value);
-  return parts.join('').trim();
 }
 
 /**
@@ -183,6 +182,83 @@ export class JiraService {
     return this.baseUrl.trim() !== '' && this.apiToken.trim() !== '';
   }
 
+  /** Cloud (email + API token) vs Server / Data Center (PAT). Decides search endpoint and assignee body shape. */
+  public get isCloud(): boolean {
+    return this.email.trim() !== '';
+  }
+
+  public issueUrl(key: string): string {
+    return `${this.apiRoot().replace(/\/rest\/api\/2$/, '')}/browse/${encodeURIComponent(key)}`;
+  }
+
+  public async getMyself(): Promise<IJiraUser | null> {
+    const raw = await this.getJson(`${this.apiRoot()}/myself`);
+    return parseJiraUser(raw);
+  }
+
+  /** Run a JQL query and return the matching issue keys (at most `maxResults`). */
+  public async searchIssues(jql: string, maxResults: number): Promise<string[]> {
+    const endpoint = this.isCloud ? 'search/jql' : 'search';
+    const url = `${this.apiRoot()}/${endpoint}?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=key`;
+    const raw = (await this.getJson(url)) as { issues?: unknown } | null;
+    if (!raw || !Array.isArray(raw.issues)) return [];
+    const keys: string[] = [];
+    for (const issue of raw.issues) {
+      const key = (issue as { key?: unknown } | null)?.key;
+      if (typeof key === 'string' && key) keys.push(key);
+    }
+    return keys;
+  }
+
+  /** One fetch with the changelog: fields, comments with ids, reporter/assignee, and the last assignment to the bot. */
+  public async getIssueForRun(key: string, bot: IJiraUser): Promise<IJiraIssueForRun | null> {
+    const url = `${this.apiRoot()}/issue/${encodeURIComponent(key)}?expand=changelog&fields=summary,description,comment,reporter,assignee`;
+    const raw = (await this.getJson(url)) as {
+      fields?: { summary?: unknown; description?: unknown; comment?: unknown; reporter?: unknown; assignee?: unknown };
+      changelog?: unknown;
+    } | null;
+    if (!raw) return null;
+    return {
+      key,
+      summary: typeof raw.fields?.summary === 'string' ? raw.fields.summary : '',
+      description: extractPlainText(raw.fields?.description),
+      reporter: parseJiraUser(raw.fields?.reporter),
+      assignee: parseJiraUser(raw.fields?.assignee),
+      comments: parseRawComments(raw.fields?.comment),
+      assignment: findLatestAssignmentToBot(raw.changelog, bot),
+    };
+  }
+
+  public async addComment(key: string, body: string): Promise<boolean> {
+    return this.send('POST', `${this.apiRoot()}/issue/${encodeURIComponent(key)}/comment`, { body });
+  }
+
+  /** Assign to `user`, or unassign with `null`. Cloud wants `accountId`, Server wants `name`. */
+  public async assign(key: string, user: IJiraUser | null): Promise<boolean> {
+    const payload = this.isCloud ? { accountId: user?.accountId ?? null } : { name: user?.name ?? null };
+    return this.send('PUT', `${this.apiRoot()}/issue/${encodeURIComponent(key)}/assignee`, payload);
+  }
+
+  public async getTransitions(key: string): Promise<Array<{ id: string; name: string }>> {
+    const raw = (await this.getJson(`${this.apiRoot()}/issue/${encodeURIComponent(key)}/transitions`)) as {
+      transitions?: unknown;
+    } | null;
+    if (!raw || !Array.isArray(raw.transitions)) return [];
+    const out: Array<{ id: string; name: string }> = [];
+    for (const t of raw.transitions) {
+      const entry = t as { id?: unknown; name?: unknown } | null;
+      if (typeof entry?.id === 'string' && typeof entry?.name === 'string')
+        out.push({ id: entry.id, name: entry.name });
+    }
+    return out;
+  }
+
+  public async transition(key: string, transitionId: string): Promise<boolean> {
+    return this.send('POST', `${this.apiRoot()}/issue/${encodeURIComponent(key)}/transitions`, {
+      transition: { id: transitionId },
+    });
+  }
+
   public async getTicket(key: string): Promise<IJiraTicket | null> {
     if (!this.isEnabled) return null;
     const url = `${this.baseUrl.replace(/\/$/, '')}/rest/api/2/issue/${encodeURIComponent(key)}?fields=summary,description,comment`;
@@ -215,6 +291,50 @@ export class JiraService {
     } catch (err) {
       LogSink.warn(`Jira: fetching ${key} threw: ${err}`, TraceTags.JIRA);
       return null;
+    }
+  }
+
+  private apiRoot(): string {
+    return `${this.baseUrl.replace(/\/$/, '')}/rest/api/2`;
+  }
+
+  /** GET JSON; null on any failure (disabled, non-OK, thrown). Logs a warning on failure. */
+  private async getJson(url: string): Promise<unknown> {
+    if (!this.isEnabled) return null;
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: 'application/json', Authorization: this.authHeader() },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        LogSink.warn(`Jira: GET ${url} failed with HTTP ${response.status}`, TraceTags.JIRA);
+        return null;
+      }
+      return await response.json();
+    } catch (err) {
+      LogSink.warn(`Jira: GET ${url} threw: ${err}`, TraceTags.JIRA);
+      return null;
+    }
+  }
+
+  /** Write call; true on 2xx. Never throws. */
+  private async send(method: 'POST' | 'PUT', url: string, payload: unknown): Promise<boolean> {
+    if (!this.isEnabled) return false;
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: this.authHeader() },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        LogSink.warn(`Jira: ${method} ${url} failed with HTTP ${response.status}`, TraceTags.JIRA);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      LogSink.warn(`Jira: ${method} ${url} threw: ${err}`, TraceTags.JIRA);
+      return false;
     }
   }
 

@@ -9,6 +9,16 @@ export interface ICarrotConfig {
   generateFixPrompts?: boolean;
   /** Post applicable code suggestions on inline review comments (validator-approved). Default: true */
   suggestCodeFixes?: boolean;
+  /**
+   * Jira project keys whose tickets this repo implements when they are
+   * assigned to the bot (Flow 4). Compared uppercase. Default: none.
+   */
+  jiraProjects?: string[];
+  /**
+   * Name of the Jira transition to apply after a successful ticket run,
+   * e.g. "In Review". Matched case-insensitive. Default: no transition.
+   */
+  jiraDoneTransition?: string;
 }
 
 export const CARROT_CONFIG_DEFAULTS: Partial<ICarrotConfig> = {

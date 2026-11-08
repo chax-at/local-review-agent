@@ -30,6 +30,7 @@ describe('cloud.mappers.toPullRequestCloud', () => {
       source: { branch: { name: 'feat' }, commit: { hash: 'abc' } },
       destination: { branch: { name: 'main' } },
       author: { account_id: 'alice' },
+      reviewers: [{ account_id: 'bob' }, { nickname: 'carol' }],
     } as any);
     expect(out).toEqual({
       id: 5,
@@ -43,6 +44,7 @@ describe('cloud.mappers.toPullRequestCloud', () => {
       sourceCommit: 'abc',
       targetBranch: 'main',
       authorUsername: 'alice',
+      reviewerUsernames: ['bob', 'carol'],
     });
   });
 

@@ -1,5 +1,11 @@
 {
+  "App": {
+    "Name": "APP_NAME",
+    "Environment": "APP_ENVIRONMENT",
+    "Release": "RELEASE"
+  },
   "DataDir": "DATA_DIR",
+  "WorkDir": "WORK_DIR",
   "Bitbucket": {
     "BaseUrl": "BITBUCKET_BASE_URL",
     "BotUsername": "BITBUCKET_BOT_USERNAME",
@@ -10,6 +16,11 @@
     "BotUsername": "BITBUCKET_CLOUD_BOT_USERNAME",
     "AccessToken": "BITBUCKET_CLOUD_ACCESS_TOKEN",
     "Email": "BITBUCKET_CLOUD_BOT_EMAIL"
+  },
+  "Forgejo": {
+    "BaseUrl": "FORGEJO_BASE_URL",
+    "Token": "FORGEJO_TOKEN",
+    "BotUsername": "FORGEJO_BOT_USERNAME"
   },
   "Jira": {
     "BaseUrl": "JIRA_BASE_URL",
@@ -23,7 +34,15 @@
     "MaxInfoTokens": { "__name": "REVIEW_MAX_INFO_TOKENS", "__format": "number" },
     "MaxExplorationTokens": { "__name": "REVIEW_MAX_EXPLORATION_TOKENS", "__format": "number" },
     "MaxValidators": { "__name": "REVIEW_MAX_VALIDATORS", "__format": "number" },
-    "SecurityScannersEnabled": { "__name": "REVIEW_SECURITY_SCANNERS_ENABLED", "__format": "boolean" }
+    "SecurityScannersEnabled": { "__name": "REVIEW_SECURITY_SCANNERS_ENABLED", "__format": "boolean" },
+    "AlwaysJudge": { "__name": "REVIEW_ALWAYS_JUDGE", "__format": "boolean" },
+    "JudgeModelSlot": { "__name": "REVIEW_JUDGE_MODEL_SLOT", "__format": "number" },
+    "AuxModelSlot": { "__name": "REVIEW_AUX_MODEL_SLOT", "__format": "number" },
+    "AuxFallbackModelSlot": { "__name": "REVIEW_AUX_FALLBACK_MODEL_SLOT", "__format": "number" },
+    "AuxMaxConcurrency": { "__name": "REVIEW_AUX_MAX_CONCURRENCY", "__format": "number" }
+  },
+  "Implement": {
+    "ModelSlot": { "__name": "IMPLEMENT_MODEL_SLOT", "__format": "number" }
   },
   "Model1": {
     "ApiKey": "MODEL1_API_KEY",
@@ -93,6 +112,23 @@
     "DockerImage": "MODEL4_DOCKER_IMAGE",
     "TimeoutMs": { "__name": "MODEL4_TIMEOUT_MS", "__format": "number" }
   },
+  "Model5": {
+    "ApiKey": "MODEL5_API_KEY",
+    "ApiBase": "MODEL5_API_BASE",
+    "Model": "MODEL5_MODEL",
+    "Name": "MODEL5_NAME",
+    "AuthHeader": "MODEL5_AUTH_HEADER",
+    "SupportsStructuredOutput": { "__name": "MODEL5_SUPPORTS_STRUCTURED_OUTPUT", "__format": "boolean" },
+    "MaxTokenParam": "MODEL5_MAX_TOKEN_PARAM",
+    "InputTokenCostPer1M": { "__name": "MODEL5_INPUT_COST", "__format": "number" },
+    "OutputTokenCostPer1M": { "__name": "MODEL5_OUTPUT_COST", "__format": "number" },
+    "Review": { "__name": "MODEL5_REVIEW", "__format": "boolean" },
+    "Validate": { "__name": "MODEL5_VALIDATE", "__format": "boolean" },
+    "Roles": "MODEL5_ROLES",
+    "Provider": "MODEL5_PROVIDER",
+    "DockerImage": "MODEL5_DOCKER_IMAGE",
+    "TimeoutMs": { "__name": "MODEL5_TIMEOUT_MS", "__format": "number" }
+  },
   "Diagnostics": {
     "DebugLogs": {
       "__name": "DIAGNOSTICS_DEBUG_LOGS",
@@ -112,6 +148,25 @@
         },
         "Host": "DIAGNOSTICS_LOGGING_GELF_HOST",
         "Port": "DIAGNOSTICS_LOGGING_GELF_PORT"
+      }
+    },
+    "OpenTelemetry": {
+      "Enabled": {
+        "__name": "DIAGNOSTICS_OPENTELEMETRY_ENABLED",
+        "__format": "boolean"
+      },
+      "Endpoint": "DIAGNOSTICS_OPENTELEMETRY_ENDPOINT",
+      "TenantId": {
+        "__name": "DIAGNOSTICS_OPENTELEMETRY_TENANTID",
+        "__format": "number"
+      },
+      "MetricsExportIntervalSeconds": {
+        "__name": "DIAGNOSTICS_OPENTELEMETRY_METRICSEXPORTINTERVALSECONDS",
+        "__format": "number"
+      },
+      "TraceSampleRatio": {
+        "__name": "DIAGNOSTICS_OPENTELEMETRY_TRACESAMPLERATIO",
+        "__format": "number"
       }
     }
   }

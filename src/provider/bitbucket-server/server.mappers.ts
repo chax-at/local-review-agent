@@ -30,6 +30,7 @@ export function toPullRequest(wire: IBitbucketPullRequest): IPullRequest {
     sourceCommit: wire.fromRef.latestCommit,
     targetBranch: wire.toRef.displayId,
     authorUsername: wire.author.user.slug,
+    reviewerUsernames: (wire.reviewers ?? []).map((r) => r.user.slug),
   };
 }
 

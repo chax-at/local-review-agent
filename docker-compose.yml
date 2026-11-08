@@ -1,16 +1,54 @@
 ---
+# The bot runs pi (and the repo lint step) as containers via `docker run`, and
+# builds the lgr-pi-runner image via `docker build`. It does NOT touch the
+# host's Docker daemon for that: a Docker-in-Docker service (`dind`) in this
+# stack is its daemon, reached over the compose network (DOCKER_HOST). Its
+# image storage is a bind mount next to data/, repos/ and tmp/, so everything
+# the bot produces lives in the instance directory on the same disk.
+#
+# The dind daemon resolves every `-v <path>` of a pi run inside the dind
+# container, so the repo clones and the bot's temp workspaces must have the
+# same absolute path in three places: host, bot container, dind container.
+# That is why repos/ and tmp/ are mounted at ${PWD}/... into both containers
+# and the bot is told to use exactly those paths (WORK_DIR, TMPDIR). data/ is
+# only read by the bot itself and keeps the fixed in-container path the
+# HEALTHCHECK uses.
+#
+# ${PWD} is the directory you run `docker compose` from — the instance
+# directory that holds this file and .env. Run compose from there.
 services:
   # One-shot init: ensure volume dirs are writable by www-data (uid 33)
   init-perms:
     image: busybox
     volumes:
-      - ./repos:/srv/www/app/repos
-      - ./data:/srv/www/app/data
-    command: sh -c "chown -R 33:33 /srv/www/app/data /srv/www/app/repos"
+      - ${PWD}/repos:/srv/www/app/repos
+      - ${PWD}/data:/srv/www/app/data
+      - ${PWD}/tmp:/srv/www/app/tmp
+    command: sh -c "chown -R 33:33 /srv/www/app/data /srv/www/app/repos /srv/www/app/tmp"
     restart: "no"
 
+  # Private Docker daemon for the bot's pi containers and image builds.
+  # `privileged` is what Docker-in-Docker needs to run its own overlayfs and
+  # namespaces. TLS is off: the port is only reachable on the compose network.
+  dind:
+    image: ${dind_image:-${from_registry:-docker.io}/library/docker:28-dind}
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      - ${PWD}/docker:/var/lib/docker
+      - ${PWD}/repos:${PWD}/repos
+      - ${PWD}/tmp:${PWD}/tmp
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
   local-git-reviewer:
-    image: "${image:-local-git-reviewer}:${tag:-latest}"
+    image: "${image:-local-git-reviewer:${tag:-latest}}"
     build:
       dockerfile: Dockerfile
       args:
@@ -20,11 +58,21 @@ services:
     env_file: .env
     environment:
       NODE_ENV: production
+      DOCKER_HOST: tcp://dind:2375
+      # Same absolute paths in host, bot and dind — see the note at the top.
+      WORK_DIR: ${PWD}/repos
+      TMPDIR: ${PWD}/tmp
+      # `npm view` at startup writes its cache under $HOME, which is in the
+      # container layer on the host's root disk. Keep it on the instance disk.
+      npm_config_cache: ${PWD}/tmp/.npm
     volumes:
-      - ./repos:/srv/www/app/repos
-      - ./data:/srv/www/app/data
+      - ${PWD}/repos:${PWD}/repos
+      - ${PWD}/tmp:${PWD}/tmp
+      - ${PWD}/data:/srv/www/app/data
     depends_on:
       init-perms:
         condition: service_completed_successfully
+      dind:
+        condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 6m

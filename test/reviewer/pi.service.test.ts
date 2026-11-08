@@ -10,7 +10,12 @@ import {
   assertPiProducedResponse,
   buildProviderEnvArgs,
   writeAttachment,
+  buildVerifyPrompt,
+  buildImplementPrompt,
+  parsePiVerifications,
+  extractVerifications,
 } from '../../src/reviewer/pi.service';
+import { LINTER_TONE } from '../../src/reviewer/personas';
 
 describe('parsePiFindings', () => {
   it('should extract findings from pi JSON output', () => {
@@ -183,6 +188,80 @@ describe('assertPiProducedResponse', () => {
   });
 });
 
+describe('buildVerifyPrompt', () => {
+  it('instructs pi to verify without modifying files, and specifies the JSON shape', () => {
+    const prompt = buildVerifyPrompt();
+    expect(prompt).toContain('Do not modify any files');
+    expect(prompt).toContain('"supported"');
+    expect(prompt).toContain('"evidence"');
+    expect(prompt).toContain(LINTER_TONE);
+  });
+});
+
+describe('parsePiVerifications', () => {
+  it('parses well-formed verification results', () => {
+    const text = JSON.stringify({
+      results: [
+        { index: 0, supported: true, evidence: 'the null check is present at line 12' },
+        { index: 1, supported: false, evidence: 'no such branch exists' },
+      ],
+    });
+    expect(parsePiVerifications(text)).toEqual([
+      { index: 0, supported: true, evidence: 'the null check is present at line 12' },
+      { index: 1, supported: false, evidence: 'no such branch exists' },
+    ]);
+  });
+
+  it('skips malformed entries', () => {
+    const text = JSON.stringify({
+      results: [
+        { index: 'not-a-number', supported: true, evidence: 'x' },
+        { index: 0, supported: 'yes', evidence: 'x' },
+        { index: 1, supported: true, evidence: 42 },
+        { index: 2, supported: false, evidence: 'valid one' },
+      ],
+    });
+    expect(parsePiVerifications(text)).toEqual([{ index: 2, supported: false, evidence: 'valid one' }]);
+  });
+
+  it('returns an empty array for unparseable or shapeless output', () => {
+    expect(parsePiVerifications('not json')).toEqual([]);
+    expect(parsePiVerifications('{}')).toEqual([]);
+    expect(parsePiVerifications('{"results":"not an array"}')).toEqual([]);
+  });
+
+  it('caps evidence at 800 characters', () => {
+    const longEvidence = 'x'.repeat(1000);
+    const text = JSON.stringify({
+      results: [{ index: 0, supported: true, evidence: longEvidence }],
+    });
+    const parsed = parsePiVerifications(text);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].evidence).toHaveLength(800);
+    expect(parsed[0].evidence).toBe(longEvidence.slice(0, 800));
+  });
+});
+
+describe('extractVerifications', () => {
+  it('extracts from the last assistant message_end event', () => {
+    const output = [
+      '{"type":"chunk","x":1}',
+      JSON.stringify({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '{"results":[{"index":0,"supported":true,"evidence":"confirmed"}]}' }],
+        },
+      }),
+    ].join('\n');
+    expect(extractVerifications(output)).toEqual([{ index: 0, supported: true, evidence: 'confirmed' }]);
+  });
+
+  it('degrades to an empty array when no assistant message_end is present', () => {
+    expect(extractVerifications('not json at all')).toEqual([]);
+  });
+});
+
 describe('buildProviderEnvArgs', () => {
   it('passes the Anthropic key under ANTHROPIC_API_KEY and no base (built-in)', () => {
     expect(buildProviderEnvArgs('anthropic', 'sk-ant-x', 'https://api.anthropic.com/v1/', 'claude-opus-4-8')).toEqual([
@@ -250,5 +329,15 @@ describe('writeAttachment', () => {
   ])('returns no reference and writes no file for %s content', (_label, content) => {
     expect(writeAttachment(tmpDir, 'scanner-findings.md', content)).toBe('');
     expect(fs.existsSync(path.join(tmpDir, 'scanner-findings.md'))).toBe(false);
+  });
+});
+
+describe('buildImplementPrompt', () => {
+  it('points pi at /workspace/ticket.md, forbids committing, and asks for a summary', () => {
+    const prompt = buildImplementPrompt();
+    expect(prompt).toContain('/workspace/ticket.md');
+    expect(prompt).toContain('Do not commit');
+    expect(prompt.toLowerCase()).toContain('summary');
+    expect(prompt).toContain('untrusted user input');
   });
 });

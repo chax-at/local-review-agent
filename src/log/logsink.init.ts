@@ -1,6 +1,8 @@
 import { SecureTCPTransport, TCPTransport } from '@chax-at/gelf-client';
-import LogSink, { ConsoleLogDrain, GelfLogDrain } from '@chax-at/log-sink';
+import LogSink, { ConsoleLogDrain, GelfLogDrain, LogLevel, OpenTelemetryLogDrain } from '@chax-at/log-sink';
+import { logs } from '@opentelemetry/api-logs';
 import config from '../safe-config';
+import { ErrorTelemetryDrain } from './error-telemetry.drain';
 
 export async function configureLogSink(): Promise<void> {
   const debugLogs = config.get('Diagnostics.DebugLogs');
@@ -50,4 +52,16 @@ export async function configureLogSink(): Promise<void> {
       maxLevel: config.get('Diagnostics.Logging.Gelf.MaxLevel'),
     });
   }
+
+  // Without a configured OpenTelemetry SDK, the logger provider and the metrics are no-ops
+  LogSink.registerDrain(new OpenTelemetryLogDrain(logs.getLoggerProvider().getLogger('default')), {
+    enabled: true,
+    minLevel: LogLevel.Error,
+    maxLevel: debugLogs ? LogLevel.Debug : LogLevel.Info,
+  });
+  LogSink.registerDrain(new ErrorTelemetryDrain(), {
+    enabled: true,
+    minLevel: LogLevel.Error,
+    maxLevel: LogLevel.Error,
+  });
 }

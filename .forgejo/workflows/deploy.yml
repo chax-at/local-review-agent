@@ -1,184 +1,162 @@
 # Builds a reproducible image on every push to main, pushes it to oci.chax.at
 # (a Zot registry, published to via Forgejo OIDC workload identity + buildah/
-# skopeo — daemonless, no Docker socket needed), then deploys it to both
-# production instances (the Bitbucket Server poller and the cloud poller),
-# which run side by side on the same host with separate persisted data/repos
-# dirs.
-#
-# Required repo secrets: SSH_PRIVATE_KEY, DEPLOY_PRODUCTION_USERNAME,
-# DEPLOY_PRODUCTION_HOSTNAME, OCI_REGISTRY_USER, OCI_REGISTRY_TOKEN.
-# Optional repo variable: DEPLOY_PATH (defaults to /srv/local-git-reviewer).
+# skopeo — daemonless, no Docker socket needed), then deploys it to every
+# production instance (the Bitbucket Server, Bitbucket Cloud and Forgejo
+# pollers), which run side by side on the same host with separate persisted
+# data/repos dirs. An instance uses docker-compose.<instance>.yml as an
+# override when that file exists.
 #
 # Adjust `runs-on: docker` below if your runner uses a different label.
 name: deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/*']
 
-# Forgejo's spelling of GitHub's `permissions: id-token: write`. Injects
-# ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN into the
-# build-and-push job so it can mint a per-job OIDC id-token for oci.chax.at.
 enable-openid-connect: true
 
 concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
-env:
-  IMAGE_REF: oci.chax.at/chax-local-git-reviewer/local-git-reviewer
+  group: deploy-${{ forgejo.repository }}
+  cancel-in-progress: ${{ forgejo.ref_name != 'main' }}
 
 jobs:
   verify:
-    runs-on: docker
+    runs-on: ubuntu-latest
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
-      - uses: https://data.forgejo.org/actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with: { node-version-file: .nvmrc }
+
       - run: npm run ci:lint
       - run: npm run ci:typecheck
       - run: npm run ci:test
       - run: npm run ci:audit
+        continue-on-error: true
 
-  build-and-push:
-    needs: verify
-    # Runs on the user's default build image (has node for JS actions but no
-    # container tooling); buildah + skopeo are installed at runtime below.
-    runs-on: docker
-    env:
-      # Must be listed in the Zot server's http.auth.bearer.oidc[].audiences.
-      OIDC_AUDIENCE: oci.chax.at
-      # Daemonless + unprivileged: buildah runs as root with the vfs driver
-      # and chroot isolation, so it needs no Docker socket and no
-      # user-namespace setup.
-      STORAGE_DRIVER: vfs
-      BUILDAH_ISOLATION: chroot
+      - name: Generate CycloneDX SBOM
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-file sbom.json
+
+      - name: Upload SBOM to Dependency Track
+        uses: https://github.com/Rosslight/DependencyTrackChecker@v1.3
+        id: dtrack
+        with:
+          server-hostname: https://${{ vars.DEPENDENCYTRACK_HOST }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+          project: ${{ vars.DEPENDENCYTRACK_PROJECT }}
+          bom-filename: sbom.json
+
+      - name: Dependency Track Results
+        run: |
+          cat <<-EOT
+          Risk Score: ${{ steps.dtrack.outputs.risk-score }}
+          Violations: ${{ steps.dtrack.outputs.violations-total }}
+          Vulnerabilities: ${{ steps.dtrack.outputs.vulnerabilities }}
+          EOT
+
+  build:
+    runs-on: podman
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - name: Install buildah + skopeo
-        run: |
-          set -eu
-          if command -v buildah >/dev/null && command -v skopeo >/dev/null; then
-            echo "already present"
-          elif command -v apt-get >/dev/null; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends buildah skopeo netavark aardvark-dns ca-certificates curl
-          elif command -v apk >/dev/null; then
-            apk add --no-cache buildah skopeo netavark aardvark-dns ca-certificates curl
-          elif command -v dnf >/dev/null; then
-            dnf install -y buildah skopeo netavark aardvark-dns ca-certificates curl
-          elif command -v yum >/dev/null; then
-            yum install -y buildah skopeo netavark aardvark-dns ca-certificates curl
-          else
-            echo "::error::no supported package manager (apt/apk/dnf/yum) found"
-            exit 1
-          fi
-          buildah --version
-          skopeo --version
+      - name: Build
+        uses: actions/oci-build@main
+        with:
+          annotations: |
+            org.opencontainers.image.description=chax-local-git-reviewer
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.title=chax-local-git-reviewer
 
-      - name: Mint OIDC id-token from Forgejo
-        id: oidc
-        run: |
-          set -euo pipefail
-          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            echo "::error::ACTIONS_ID_TOKEN_REQUEST_URL not set — is 'enable-openid-connect' active and the runner > v12.5.0?"
-            exit 1
-          fi
-
-          TOKEN="$(curl -fsSL \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" \
-            | sed -E 's/.*"value":"([^"]+)".*/\1/')"
-
-          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "::error::failed to obtain OIDC token"
-            exit 1
-          fi
-
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Build image (daemonless, via buildah)
-        run: |
-          set -euo pipefail
-
-          # Use a FRESH, job-local graphroot so we never inherit a prior
-          # job's overlay-driver store (which fails as overlay-over-overlayfs).
-          # Explicit --storage-driver vfs beats any storage.conf on the image.
-          STORE="${RUNNER_TEMP:-/var/tmp}/buildah"
-          echo "STORE=$STORE" >> "$GITHUB_ENV"
-          OCIDIR="${RUNNER_TEMP:-/var/tmp}/image-oci"
-          echo "OCIDIR=$OCIDIR" >> "$GITHUB_ENV"
-          rm -rf "$STORE" "$OCIDIR"
-
-          BUILDAH=(buildah --root "$STORE/root" --runroot "$STORE/runroot" --storage-driver vfs)
-
-          # --network=host joins the host netns so buildah needs no
-          # CNI/netavark bridge setup.
-          "${BUILDAH[@]}" bud \
-            --isolation chroot \
-            --network=host \
-            -t "${IMAGE_REF}:${{ github.sha }}" \
-            -f Dockerfile .
-
-          # Export to a plain OCI-layout dir so the push step can use skopeo
-          # without touching (the broken) containers-storage.
-          "${BUILDAH[@]}" push "${IMAGE_REF}:${{ github.sha }}" "oci:${OCIDIR}:${{ github.sha }}"
-
-      - name: Publish to Zot with OIDC bearer token
-        run: |
-          set -euo pipefail
-
-          # skopeo --dest-registry-token sends `Authorization: Bearer <token>`
-          # directly to /v2/ — which is exactly how Zot's OIDC-workload auth
-          # expects the id-token to arrive (no basic-auth token dance).
-          skopeo copy --all \
-            --dest-registry-token "${{ steps.oidc.outputs.token }}" \
-            "oci:${OCIDIR}:${{ github.sha }}" \
-            "docker://${IMAGE_REF}:${{ github.sha }}"
+      - name: Publish Image
+        uses: actions/oci-copy@main
+        id: publish
+        with:
+          tags: |
+            build-${{ forgejo.run_number }}
+            sha-${{ forgejo.sha }}
+            ${{ forgejo.ref_name == 'main' && 'latest' || '' }}
 
   deploy:
-    needs: build-and-push
-    runs-on: docker
+    if: forgejo.ref == 'refs/heads/main'
+    needs: [verify, build]
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        instance: [server, cloud]
+        instance: [server, cloud, forge]
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
       - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}" >> ~/.ssh/known_hosts
+        uses: actions/setup-ssh@main
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          scan-hosts: ${{ vars.DEPLOY_PRODUCTION_HOSTNAME }}
 
       - name: Sync compose file(s)
         run: |
-          remote_dir="${{ vars.DEPLOY_PATH || '/srv/local-git-reviewer' }}/${{ matrix.instance }}"
+          remote_dir="${{ vars.DEPLOY_PATH || format('/srv/app/{0}', forgejo.repository) }}/${{ matrix.instance }}"
           files="docker-compose.yml"
-          if [ "${{ matrix.instance }}" = "cloud" ]; then
-            files="$files docker-compose.cloud.yml"
+          if [ -f "docker-compose.${{ matrix.instance }}.yml" ]; then
+            files="$files docker-compose.${{ matrix.instance }}.yml"
           fi
-          rsync -az -e "ssh -i ~/.ssh/deploy_key" $files \
-            "${{ secrets.DEPLOY_PRODUCTION_USERNAME }}@${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}:$remote_dir/"
+          rsync -az --mkpath $files \
+            "${{ vars.DEPLOY_PRODUCTION_USERNAME }}@${{ vars.DEPLOY_PRODUCTION_HOSTNAME }}:$remote_dir/"
 
       - name: Pull and restart
         run: |
-          remote_dir="${{ vars.DEPLOY_PATH || '/srv/local-git-reviewer' }}/${{ matrix.instance }}"
+          set -euo pipefail
+          TOKEN="$(curl -fsSL \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${{ vars.OCI_REGISTRY }}" \
+            | sed -E 's/.*"value":"([^"]+)".*/\1/')"
+          echo "::add-mask::$TOKEN"
+          
+          remote_dir="${{ vars.DEPLOY_PATH || format('/srv/app/{0}', forgejo.repository) }}/${{ matrix.instance }}"
           compose_files="-f docker-compose.yml"
-          if [ "${{ matrix.instance }}" = "cloud" ]; then
-            compose_files="$compose_files -f docker-compose.cloud.yml"
+          if [ -f "docker-compose.${{ matrix.instance }}.yml" ]; then
+            compose_files="$compose_files -f docker-compose.${{ matrix.instance }}.yml"
           fi
-          ssh -i ~/.ssh/deploy_key "${{ secrets.DEPLOY_PRODUCTION_USERNAME }}@${{ secrets.DEPLOY_PRODUCTION_HOSTNAME }}" bash -s <<EOF
+          ssh "${{ vars.DEPLOY_PRODUCTION_USERNAME }}@${{ vars.DEPLOY_PRODUCTION_HOSTNAME }}" bash -s <<EOF
             set -euo pipefail
             cd "$remote_dir"
-            echo "${{ secrets.OCI_REGISTRY_TOKEN }}" | docker login oci.chax.at -u "${{ secrets.OCI_REGISTRY_USER }}" --password-stdin
-            image="${{ env.IMAGE_REF }}" tag="${{ github.sha }}" docker compose $compose_files pull
-            image="${{ env.IMAGE_REF }}" tag="${{ github.sha }}" docker compose $compose_files up -d --remove-orphans
-            docker logout oci.chax.at
+            echo "${TOKEN}" | docker login ${{ vars.OCI_REGISTRY }} -u "oidc" --password-stdin
+            image="${{ needs.build.outputs.image }}" docker compose $compose_files up -d \
+              --remove-orphans --pull always
+            docker logout ${{ vars.OCI_REGISTRY }}
+          EOF
+
+  post-deploy:
+    needs: [build, deploy]
+    # Run even when one instance fails to deploy: the others have already
+    # pulled the new image, and the old one still fills the disk.
+    if: ${{ !cancelled() && needs.build.result == 'success' && forgejo.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        uses: actions/setup-ssh@main
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          scan-hosts: ${{ vars.DEPLOY_PRODUCTION_HOSTNAME }}
+
+      # Only this app's images: the host also runs other apps, and a host-wide
+      # `docker system prune -af` deletes their stopped containers and unused
+      # images too. Every instance has restarted on the new image by now, so
+      # all other images of this repository are old; `docker rmi` refuses the
+      # ones a container still uses, so those stay. The pi-runner images live
+      # inside each instance's dind daemon and are not touched.
+      - name: Cleanup
+        run: |
+          image="${{ needs.build.outputs.image }}"
+          repo="${image%@*}"
+          repo="${repo%:*}"
+          ssh "${{ vars.DEPLOY_PRODUCTION_USERNAME }}@${{ vars.DEPLOY_PRODUCTION_HOSTNAME }}" bash -s <<EOF
+            docker image ls --filter "reference=${repo}" -q | sort -u | xargs -r docker rmi 2>/dev/null || true
+            docker image prune -f >/dev/null
           EOF

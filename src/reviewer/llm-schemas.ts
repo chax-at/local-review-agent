@@ -122,6 +122,15 @@ export const MentionRouteSchema = z.object({
 
 export const mentionRouteJsonSchema = toJsonSchema(MentionRouteSchema, 'mention_route');
 
+/** RepoPicker answer: which candidate repo a Jira ticket belongs to, and how sure the model is. */
+export const RepoPickSchema = z.object({
+  slug: z.string(),
+  confidence: z.enum(['high', 'low']),
+  reasoning: z.string(),
+});
+
+export const repoPickJsonSchema = toJsonSchema(RepoPickSchema, 'repo_pick');
+
 /** Extract JSON from raw LLM text — handles ```json fences and bare JSON */
 export function extractJson(text: string): string {
   const s = text.trim();

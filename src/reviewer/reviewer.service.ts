@@ -1,12 +1,10 @@
-import { execSync, execFileSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
+import { execFileSync } from 'child_process';
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
 import type { IGitProvider } from '../provider/provider';
 import type { IComment, IInlineCommentInput } from '../provider/provider.types';
 import { GitService } from './git.service';
-import type { PiService, IPiTokenUsage } from './pi.service';
+import type { PiService, IPiTokenUsage, IPiVerificationEntry } from './pi.service';
 import {
   splitDiffByFile,
   isDiffTooLarge,
@@ -24,6 +22,7 @@ import {
   type IValidatedFinding,
   type IFollowUpInfoGatherer,
   type IFixProposal,
+  type IPiVerifier,
 } from './multi-model-validator';
 import { InfoGatherer, type IInfoTool, type ISearchHit } from './info-gatherer';
 import { ContextExplorer } from './context-explorer';
@@ -32,11 +31,15 @@ import { attributionSuffix } from './finding-attribution';
 import { buildPrInfoBlob, type ITicketInfo } from './pr-context';
 import { JiraService, extractTicketKey } from '../jira/jira.service';
 import { FindingDeduplicator } from './finding-deduplicator';
+import { FailureExplainer } from './failure-explainer';
 import { branchTimestamp, isBotComment } from '../constants';
 import { hasBotReviewForCommit, reviewCommitMarker } from './review-marker';
 import type { IMentionToolResult } from '../poller/mention-executor';
 import type { ReviewPersona } from './personas';
 import { PERSONA_DIRECTIVES, STANDARDS_REQUIRED_PERSONAS } from './personas';
+import { runFixValidationLoop, runLintAndFixErrors, type IFixLoopDeps } from './fix-loop';
+import { metricMeters, recordModelUsage, type ReviewOutcome } from '../instrumentation/metrics';
+import { ATTR_VCS_CHANGE_ID, ATTR_VCS_REPOSITORY_NAME, runInRootSpan } from '../instrumentation/tracing';
 
 /** A model that performs the review pass via its pi-runner, with cost metadata for usage attribution. */
 export interface IReviewModel {
@@ -54,6 +57,32 @@ export function groupFindingsByFile(findings: IAuthoredFinding[]): Map<string, I
     const list = out.get(f.filePath);
     if (list) list.push(f);
     else out.set(f.filePath, [f]);
+  }
+  return out;
+}
+
+/** Map global finding indices to pi's local 0..N-1 indexing for one verification call. */
+export function buildPiVerificationInputs(
+  findings: IAuthoredFinding[],
+  splitIndices: number[],
+): Array<{ index: number; filePath: string; line: number; comment: string }> {
+  return splitIndices.map((gi, local) => ({
+    index: local,
+    filePath: findings[gi].filePath,
+    line: findings[gi].line,
+    comment: findings[gi].comment,
+  }));
+}
+
+/** Remap a verification result keyed by pi's local indices back to the original global finding indices. */
+export function mapVerificationResultsBack(
+  localResults: Map<number, IPiVerificationEntry>,
+  splitIndices: number[],
+): Map<number, IPiVerificationEntry> {
+  const out = new Map<number, IPiVerificationEntry>();
+  for (const [local, entry] of localResults) {
+    if (local < 0 || local >= splitIndices.length) continue;
+    out.set(splitIndices[local], entry);
   }
   return out;
 }
@@ -240,6 +269,7 @@ export class ReviewerService {
   private readonly contextExplorer: ContextExplorer;
   private readonly securityScanner: SecurityScanner;
   private readonly jira: JiraService;
+  private readonly failureExplainer: FailureExplainer;
   private readonly heartbeat: () => void;
 
   constructor(
@@ -263,6 +293,8 @@ export class ReviewerService {
      * review loop ticks between runs instead. Defaults to a no-op for tests.
      */
     heartbeat: () => void = () => {},
+    /** Turns a review's final-attempt failure into a plain-language PR comment. Defaults to disabled (raw error text only). */
+    failureExplainer: FailureExplainer = new FailureExplainer(null),
   ) {
     this.provider = provider;
     this.git = git;
@@ -279,6 +311,7 @@ export class ReviewerService {
     this.securityScanner = securityScanner;
     this.jira = jira;
     this.heartbeat = heartbeat;
+    this.failureExplainer = failureExplainer;
   }
 
   /**
@@ -293,9 +326,14 @@ export class ReviewerService {
     return this.multiValidator.withRandomSubset(this.maxValidators, deprioritizeNames);
   }
 
-  /** Pi-runner used for fix/propose/lint operations: the first review-enabled model. */
-  private get primaryPi(): PiService | null {
-    return this.reviewModels[0]?.pi ?? null;
+  /** Dependencies for the shared fix-validation loop, with the validator subset picked once per operation. */
+  private fixLoopDeps(label: string): IFixLoopDeps {
+    return {
+      primaryModel: this.reviewModels[0] ?? null,
+      validator: this.pickActiveValidator(),
+      toModelUsage: (rm, usage) => this.toModelUsage(rm, usage),
+      label,
+    };
   }
 
   /**
@@ -345,7 +383,24 @@ export class ReviewerService {
     };
   }
 
-  public async reviewPr(
+  /** Runs one review as a trace of its own and counts it with its outcome and duration. */
+  public async reviewPr(...args: Parameters<ReviewerService['runReviewPr']>): Promise<void> {
+    const [project, slug, prId] = args;
+    const startTime = performance.now();
+    let outcome: ReviewOutcome = 'failed';
+    try {
+      outcome = await runInRootSpan(
+        'PR review',
+        { [ATTR_VCS_REPOSITORY_NAME]: `${project}/${slug}`, [ATTR_VCS_CHANGE_ID]: prId },
+        () => this.runReviewPr(...args),
+      );
+    } finally {
+      metricMeters.reviews.add(1, { outcome });
+      metricMeters.reviewDuration.record((performance.now() - startTime) / 1000, { outcome });
+    }
+  }
+
+  private async runReviewPr(
     project: string,
     slug: string,
     prId: number,
@@ -356,7 +411,14 @@ export class ReviewerService {
     generateFixPrompts?: boolean,
     sourceCommit?: string,
     skipIfReviewed = false,
-  ): Promise<void> {
+    /**
+     * True when the caller (the poller's auto-review retry loop) has no
+     * retries left after this attempt. On a throw, the failure comment gets
+     * an LLM-written plain-language explanation (via `failureExplainer`) plus
+     * a "won't retry automatically" note, instead of just the raw error.
+     */
+    isFinalAutoReviewAttempt = false,
+  ): Promise<ReviewOutcome> {
     LogSink.info(`Reviewing PR #${prId} in ${project}/${slug}`, TraceTags.REVIEWER);
 
     // Fetch existing PR comments once: the reviewers see them (so they react to
@@ -374,7 +436,7 @@ export class ReviewerService {
         `PR #${prId}: bot review for commit ${sourceCommit.slice(0, 7)} already present, skipping (local state was missing/stale)`,
         TraceTags.REVIEWER,
       );
-      return;
+      return 'skipped';
     }
 
     const reviewCommentContext = formatExistingCommentsForReview(existingComments);
@@ -420,15 +482,11 @@ export class ReviewerService {
       );
     } catch (err) {
       LogSink.error(`PR #${prId}: review failed: ${err}`, TraceTags.REVIEWER);
-      await this.postOrUpdateFailureComment(
-        project,
-        slug,
-        prId,
-        `Automated review failed: ${String(err).slice(0, 200)}`,
-      );
+      const message = await this.buildFailureMessage(String(err), isFinalAutoReviewAttempt);
+      await this.postOrUpdateFailureComment(project, slug, prId, message);
       throw err;
     }
-    if (!result) return;
+    if (!result) return 'skipped';
 
     const { allFindings, reviewUsage, chunks, fullDiff } = result;
 
@@ -456,6 +514,7 @@ export class ReviewerService {
         sourceBranch,
         activeValidator,
         existingComments,
+        dockerImage,
       );
 
     // Best-effort: inline comments are already posted and the PR's review state
@@ -481,6 +540,7 @@ export class ReviewerService {
     } catch (err) {
       LogSink.warn(`PR #${prId}: failed to post review summary, continuing: ${err}`, TraceTags.REVIEWER);
     }
+    return 'reviewed';
   }
 
   private async runReview(
@@ -668,6 +728,7 @@ export class ReviewerService {
     sourceBranch: string,
     activeValidator: MultiModelValidator,
     existingComments: IComment[],
+    dockerImage?: string,
   ): Promise<{
     validationUsage: IModelUsage[];
     validatedFindings: IValidatedFinding[];
@@ -798,6 +859,37 @@ export class ReviewerService {
         };
       }
 
+      const piVerify: IPiVerifier = async (findingsArg, splitIndices) => {
+        const primaryModel = this.reviewModels[0];
+        if (!primaryModel) return { results: new Map(), usage: [], modelName: null };
+        try {
+          // The verification container blocks the event loop for its whole
+          // run (like every other pi call) and can now run long enough to
+          // risk the container health check going stale without a tick.
+          this.heartbeat();
+          // pi reads the working tree directly, so it must be checked out at
+          // the PR's source branch tip — same requirement as the
+          // info-gatherer's git-grep tool above. A failed reset must not
+          // proceed to verify against a stale tree, so it falls through to
+          // the catch below (no evidence) rather than being swallowed here.
+          this.git.resetToRemoteBranch(project, slug, sourceBranch);
+          const repoDir = this.git.getRepoDir(project, slug);
+          const inputs = buildPiVerificationInputs(findingsArg, splitIndices);
+          const verification = primaryModel.pi.verifyFindings(inputs, repoDir, dockerImage);
+          return {
+            results: mapVerificationResultsBack(verification.results, splitIndices),
+            usage: [this.toModelUsage(primaryModel, verification.usage)],
+            modelName: primaryModel.name,
+          };
+        } catch (err) {
+          LogSink.warn(
+            `PR #${prId}: pi verification failed, judging on round-1 votes alone: ${err}`,
+            TraceTags.REVIEWER,
+          );
+          return { results: new Map(), usage: [], modelName: null };
+        }
+      };
+
       try {
         const validation = await activeValidator.validateFindings(
           dedupedFindings,
@@ -806,6 +898,7 @@ export class ReviewerService {
           humanComments,
           additionalContextByFile,
           followUpGather,
+          piVerify,
         );
         validatedFindings = validation.findings;
         validationUsage.push(...validation.usage);
@@ -1023,10 +1116,12 @@ export class ReviewerService {
     const totalDiscarded = discardedRound1 + discardedRound2;
     const discardLine =
       totalDiscarded > 0
-        ? `\n\n*Validators discarded ${totalDiscarded} finding(s) (${discardedRound1} round 1, ${discardedRound2} round 2)*`
+        ? `\n\n*Validators discarded ${totalDiscarded} finding(s) (${discardedRound1} round 1, ${discardedRound2} deliberation)*`
         : '';
 
-    const footer = formatTokenFooter([...reviewUsage, ...validatorUsage]);
+    const usage = [...reviewUsage, ...validatorUsage];
+    recordModelUsage(usage);
+    const footer = formatTokenFooter(usage);
     // Hidden marker so a restarted daemon can detect this commit was already
     // reviewed even if its local state was lost (see reviewPr's skip guard).
     const marker = sourceCommit ? `\n\n${reviewCommitMarker(sourceCommit)}` : '';
@@ -1052,10 +1147,8 @@ export class ReviewerService {
     const fixUsage: IModelUsage[] = [];
     const summary = await this.applyPiFix(project, slug, prId, diff, repoDir, userMessage, fixUsage, dockerImage);
 
-    const { earlyReturn, usage: loopUsage } = await this.validateFixWithLoop(
-      prId,
-      project,
-      slug,
+    const { earlyReturn, usage: loopUsage } = await runFixValidationLoop(
+      this.fixLoopDeps(`PR #${prId}`),
       userMessage,
       diff,
       repoDir,
@@ -1063,6 +1156,7 @@ export class ReviewerService {
       generateFixPrompts,
     );
     fixUsage.push(...loopUsage);
+    recordModelUsage(fixUsage);
     const costFooter = `\n\n${formatTokenFooter(fixUsage)}`;
     if (earlyReturn) return { success: false, message: `${earlyReturn}${costFooter}` };
 
@@ -1108,105 +1202,6 @@ export class ReviewerService {
       await this.provider.postGeneralComment(project, slug, prId, `Automated fix failed. Will retry next cycle.`);
       throw err;
     }
-  }
-
-  /**
-   * Validates fix changes with a 3-round improvement loop using multi-model validation.
-   * Returns an early-exit string if the fix should be aborted, or null to continue.
-   */
-  private async validateFixWithLoop(
-    prId: number,
-    project: string,
-    slug: string,
-    userMessage: string,
-    originalDiff: string,
-    repoDir: string,
-    dockerImage: string | undefined,
-    generateFixPrompts?: boolean,
-  ): Promise<{ earlyReturn: string | null; usage: IModelUsage[] }> {
-    if (!this.multiValidator.hasModels) {
-      return { earlyReturn: null, usage: [] };
-    }
-
-    // Pick the validator subset once for the whole 3-round fix loop so every
-    // round sees the same validators (a model can't flip-flop just because a
-    // different sample voted).
-    const activeValidator = this.pickActiveValidator();
-    LogSink.info(
-      `PR #${prId} fix: active validators (${activeValidator.modelNames.length}): ${activeValidator.modelNames.join(', ')}`,
-      TraceTags.REVIEWER,
-    );
-
-    const primaryModel = this.reviewModels[0];
-    const allUsage: IModelUsage[] = [];
-    const feedbackHistory: string[] = [];
-
-    for (let round = 1; round <= 3; round++) {
-      // Check if pi made any changes
-      const status = execSync('git status --porcelain', { cwd: repoDir, encoding: 'utf-8' }).trim();
-      if (!status) {
-        return {
-          earlyReturn: 'No changes were needed.',
-          usage: allUsage,
-        };
-      }
-
-      const currentDiff = execSync('git diff', { cwd: repoDir, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-      const result = await activeValidator.validateFix(userMessage, currentDiff);
-      allUsage.push(...result.usage);
-
-      if (result.approved) {
-        LogSink.info(`PR #${prId}: fix approved by validators (round ${round})`, TraceTags.REVIEWER);
-        return { earlyReturn: null, usage: allUsage };
-      }
-
-      feedbackHistory.push(`Round ${round}: ${result.summary}`);
-
-      if (round < 3) {
-        LogSink.info(`PR #${prId}: validators request changes (round ${round}), revising...`, TraceTags.REVIEWER);
-        // Reset and let pi try again with feedback
-        execSync('git checkout -- .', { cwd: repoDir, stdio: 'pipe' });
-        execSync('git clean -fd', { cwd: repoDir, stdio: 'pipe' });
-        if (!primaryModel) break;
-        try {
-          const revision = primaryModel.pi.fix(
-            originalDiff,
-            repoDir,
-            `Previous attempt feedback:\n${result.summary}\n\nOriginal request: ${userMessage}`,
-            dockerImage,
-          );
-          allUsage.push(this.toModelUsage(primaryModel, revision.usage));
-        } catch (err) {
-          LogSink.error(`PR #${prId}: pi revision failed in round ${round}: ${err}`, TraceTags.REVIEWER);
-          break;
-        }
-      }
-    }
-
-    // All rounds exhausted -- summarize failure + generate fix prompt for manual use
-    const failure = await activeValidator.summarizeFailure(feedbackHistory);
-    allUsage.push(...failure.usage);
-
-    let rejectionPrompt = '';
-    if (generateFixPrompts) {
-      try {
-        const lastDiff = execSync('git diff', { cwd: repoDir, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
-        const { prompt, usage } = await activeValidator.generateRejectionPrompt(userMessage, lastDiff, feedbackHistory);
-        allUsage.push(...usage);
-        if (prompt) {
-          rejectionPrompt = `\n\n---\n**Suggested fix prompt:**\n\`\`\`\n${prompt}\n\`\`\``;
-        }
-      } catch (err) {
-        LogSink.warn(`PR #${prId}: rejection prompt generation failed: ${err}`, TraceTags.REVIEWER);
-      }
-    }
-
-    execSync('git checkout -- .', { cwd: repoDir, stdio: 'pipe' });
-    execSync('git clean -fd', { cwd: repoDir, stdio: 'pipe' });
-    return {
-      earlyReturn: `Fix rejected after review: ${failure.summary}${rejectionPrompt}`,
-      usage: allUsage,
-    };
   }
 
   private async createFixBranchAndPr(
@@ -1256,12 +1251,11 @@ export class ReviewerService {
     const fixUsage: IModelUsage[] = [];
     const summary = await this.applyPiFix(project, slug, prId, diff, repoDir, fixMessage, fixUsage, dockerImage);
 
-    const lintResult = this.runLintAndFixErrors(prId, repoDir, diff, fixUsage, dockerImage);
+    const loopDeps = this.fixLoopDeps(`PR #${prId}`);
+    const lintResult = runLintAndFixErrors(loopDeps, repoDir, diff, fixUsage, dockerImage);
 
-    const { earlyReturn, usage: loopUsage } = await this.validateFixWithLoop(
-      prId,
-      project,
-      slug,
+    const { earlyReturn, usage: loopUsage } = await runFixValidationLoop(
+      loopDeps,
       fixMessage,
       diff,
       repoDir,
@@ -1269,6 +1263,7 @@ export class ReviewerService {
       generateFixPrompts,
     );
     fixUsage.push(...loopUsage);
+    recordModelUsage(fixUsage);
     const costFooter = `\n\n${formatTokenFooter(fixUsage)}`;
     if (earlyReturn) return { success: false, message: `${earlyReturn}${costFooter}` };
 
@@ -1293,53 +1288,31 @@ export class ReviewerService {
       : 'Fix any issues found in this PR based on the diff.';
   }
 
-  private runLintAndFixErrors(
-    prId: number,
-    repoDir: string,
-    diff: string,
-    usageOut: IModelUsage[],
-    dockerImage?: string,
-  ): { failed: boolean; output: string } {
-    const lintResult = this.runLint(repoDir, dockerImage);
-    const primaryModel = this.reviewModels[0];
-    if (lintResult.failed && lintResult.output && primaryModel) {
-      LogSink.info(`PR #${prId}: lint failed after autofix, running pi to fix lint errors`, TraceTags.REVIEWER);
-      try {
-        const lintFix = primaryModel.pi.fix(
-          diff,
-          repoDir,
-          `The linter found errors after applying fixes. ONLY FIX THE LINT ERRORS below. Do NOT touch warnings. Do NOT make any other changes.\n\nLint output:\n${lintResult.output.slice(0, 8000)}`,
-          dockerImage,
-        );
-        usageOut.push(this.toModelUsage(primaryModel, lintFix.usage));
-      } catch (err) {
-        LogSink.warn(`PR #${prId}: lint fix attempt failed: ${err}`, TraceTags.REVIEWER);
-      }
+  /**
+   * Every attempt gets the raw (truncated) error, cheap and immediate. The
+   * final auto-review attempt additionally gets an LLM-written plain-language
+   * explanation (when a failure-explainer model is configured) plus a note
+   * that the bot has given up and won't retry — so a reader doesn't have to
+   * guess whether another attempt is still coming.
+   */
+  private async buildFailureMessage(rawError: string, isFinalAutoReviewAttempt: boolean): Promise<string> {
+    if (!isFinalAutoReviewAttempt || !this.failureExplainer.isEnabled) {
+      return `Automated review failed: ${rawError.slice(0, 200)}`;
     }
-    return lintResult;
-  }
 
-  private runLint(repoDir: string, dockerImage?: string): { failed: boolean; output: string } {
-    const { primaryPi } = this;
-    if (!primaryPi) return { failed: false, output: '' };
-    let pkg: { scripts?: Record<string, string> };
-    try {
-      pkg = JSON.parse(fs.readFileSync(path.join(repoDir, 'package.json'), 'utf-8'));
-    } catch {
-      // No package.json or invalid JSON → no lint to run.
-      return { failed: false, output: '' };
+    const { text, usage } = await this.failureExplainer.explain(rawError);
+    if (usage.length > 0) {
+      LogSink.debug(`Failure explainer usage: ${JSON.stringify(usage)}`, TraceTags.REVIEWER);
     }
-    const script = pkg.scripts?.['ci:lint']
-      ? 'ci:lint'
-      : pkg.scripts?.['ci:stylecheck']
-        ? 'ci:stylecheck'
-        : pkg.scripts?.lint
-          ? 'lint'
-          : null;
-    if (!script) return { failed: false, output: '' };
-
-    LogSink.debug(`Running lint in Docker: npm run ${script}`, TraceTags.REVIEWER);
-    return primaryPi.runLint(repoDir, script, dockerImage);
+    return [
+      `Automated review failed and will not retry automatically.`,
+      '',
+      text,
+      '',
+      `Raw error: ${rawError.slice(0, 200)}`,
+      '',
+      `Mention @${this.botUsername} on this PR to try again.`,
+    ].join('\n');
   }
 
   /**

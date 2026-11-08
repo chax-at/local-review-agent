@@ -90,7 +90,7 @@ export class LlmClient {
       ...this.config.extraBody,
     };
 
-    // Structured output: only when model supports it (inspired by storywise endpoint flags)
+    // Structured output: only when model supports it
     if (opts?.jsonMode && this.supportsStructuredOutput()) {
       if (opts.jsonSchema) {
         // Full json_schema mode — most reliable for parsing
@@ -183,5 +183,33 @@ export class LlmClient {
     return this.config.authHeader === 'api-key'
       ? { 'api-key': this.config.apiKey }
       : { Authorization: `Bearer ${this.config.apiKey}` };
+  }
+}
+
+/**
+ * Call `primary.chat(...)`; on failure, log and retry once against `fallback`
+ * (when set) instead of giving up. Used to let an unreliable model (e.g. a
+ * local AI) stand in for a single-model helper role — info gathering, context
+ * exploration, dedup — while a known-reliable model catches its failures.
+ *
+ * Returns which client actually served the response (`servedBy`) so the
+ * caller can attribute token cost to the right model instead of always
+ * charging the primary's rate — this must stay a local return value, not
+ * instance state, since callers may run several `chatWithFallback` calls for
+ * the same primary/fallback pair concurrently (e.g. one per file).
+ */
+export async function chatWithFallback(
+  primary: LlmClient,
+  fallback: LlmClient | null,
+  systemPrompt: string,
+  userMessage: string,
+  opts?: { jsonMode?: boolean; jsonSchema?: IJsonSchema },
+): Promise<{ response: ILlmResponse; servedBy: LlmClient }> {
+  try {
+    return { response: await primary.chat(systemPrompt, userMessage, opts), servedBy: primary };
+  } catch (err) {
+    if (!fallback) throw err;
+    LogSink.warn(`LLM ${primary.name} failed, falling back to ${fallback.name}: ${err}`, TraceTags.PI);
+    return { response: await fallback.chat(systemPrompt, userMessage, opts), servedBy: fallback };
   }
 }

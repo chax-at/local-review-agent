@@ -1,8 +1,10 @@
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
-import type { LlmClient, ILlmResponse } from './llm-client';
+import { chatWithFallback, type LlmClient, type ILlmResponse } from './llm-client';
+import { mapWithConcurrency } from './concurrency';
 import type { IAuthoredFinding, IModelUsage } from '../types';
 import { DedupClustersSchema, dedupClustersJsonSchema, parseWithSchema } from './llm-schemas';
+import { LINTER_TONE } from './personas';
 
 export interface IDedupeResult {
   /** Findings after collapsing same-run duplicates. Merged findings carry `contributingAuthors`. */
@@ -35,7 +37,18 @@ const MAX_COMMENT_CHARS = 1000;
  * dedup failed.
  */
 export class FindingDeduplicator {
-  constructor(private readonly llm: LlmClient | null) {}
+  constructor(
+    private readonly llm: LlmClient | null,
+    /** Tried when `llm` (e.g. an unreliable local model) fails a call. */
+    private readonly fallbackLlm: LlmClient | null = null,
+    /**
+     * Cap on concurrent per-file dedup calls. A large PR has many files;
+     * firing one completion request per file at once can overwhelm a local
+     * model server (REVIEW_AUX_MAX_CONCURRENCY), which then times out every
+     * request instead of serving them.
+     */
+    private readonly maxConcurrency: number = 4,
+  ) {}
 
   public get isEnabled(): boolean {
     return this.llm !== null;
@@ -54,12 +67,14 @@ export class FindingDeduplicator {
       else byFile.set(f.filePath, [f]);
     }
 
-    // Per-file dedup calls are independent — run them in parallel. dedupeFile
-    // catches its own errors and returns the file's findings unmerged, so one
-    // broken file can't poison the batch; allSettled is a belt-and-braces guard
-    // and recovers the input on the (unexpected) rejection path.
+    // Per-file dedup calls are independent — run them in parallel, bounded by
+    // maxConcurrency so a large PR can't flood the model with one request per
+    // file at once. dedupeFile catches its own errors and returns the file's
+    // findings unmerged, so one broken file can't poison the batch;
+    // allSettled-shaped results are a belt-and-braces guard and recover the
+    // input on the (unexpected) rejection path.
     const fileGroups = [...byFile.values()];
-    const settled = await Promise.allSettled(fileGroups.map((g) => this.dedupeFile(g)));
+    const settled = await mapWithConcurrency(fileGroups, this.maxConcurrency, (g) => this.dedupeFile(g));
 
     const out: IAuthoredFinding[] = [];
     const usage: IModelUsage[] = [];
@@ -87,21 +102,27 @@ export class FindingDeduplicator {
     const { filePath } = fileFindings[0];
 
     let response: ILlmResponse;
+    let servedBy: LlmClient;
     try {
-      response = await this.llm!.chat(this.systemPrompt(filePath), this.userMessage(filePath, fileFindings), {
-        jsonMode: true,
-        jsonSchema: dedupClustersJsonSchema,
-      });
+      const result = await chatWithFallback(
+        this.llm!,
+        this.fallbackLlm,
+        this.systemPrompt(filePath),
+        this.userMessage(filePath, fileFindings),
+        { jsonMode: true, jsonSchema: dedupClustersJsonSchema },
+      );
+      response = result.response;
+      servedBy = result.servedBy;
     } catch (err) {
       LogSink.warn(`Dedup ${this.llm!.name} failed for ${filePath}, keeping all findings: ${err}`, TraceTags.PI);
       return { findings: fileFindings, usage: [], mergedClusters: 0 };
     }
 
-    const usage = [this.trackUsage(response)];
+    const usage = [this.trackUsage(response, servedBy)];
     const parsed = parseWithSchema(response.content, DedupClustersSchema);
     if (!parsed) {
       LogSink.warn(
-        `Dedup ${this.llm!.name} returned unparseable response for ${filePath}, keeping all findings`,
+        `Dedup ${servedBy.name} returned unparseable response for ${filePath}, keeping all findings`,
         TraceTags.PI,
       );
       return { findings: fileFindings, usage, mergedClusters: 0 };
@@ -193,6 +214,7 @@ export class FindingDeduplicator {
       'Assign every finding index to exactly one cluster.',
       'For a cluster that merges 2+ findings, write one `mergedComment` that combines BOTH reasons for triggering so no information is lost.',
       'For a single-finding cluster, set mergedComment to "".',
+      LINTER_TONE,
       'Be conservative: only merge findings that are genuinely the same issue. When in doubt, keep them separate.',
       'Return JSON: { "clusters": [ { "memberIndexes": [0, 2], "mergedComment": "..." }, { "memberIndexes": [1], "mergedComment": "" } ] }',
     ].join('\n');
@@ -208,13 +230,12 @@ export class FindingDeduplicator {
     return [`## Findings on \`${filePath}\`:`, JSON.stringify(items)].join('\n');
   }
 
-  private trackUsage(response: ILlmResponse): IModelUsage {
-    const llm = this.llm!;
+  private trackUsage(response: ILlmResponse, servedBy: LlmClient): IModelUsage {
     const cost =
-      (response.inputTokens / 1_000_000) * llm.inputCostPer1M +
-      (response.outputTokens / 1_000_000) * llm.outputCostPer1M;
+      (response.inputTokens / 1_000_000) * servedBy.inputCostPer1M +
+      (response.outputTokens / 1_000_000) * servedBy.outputCostPer1M;
     return {
-      modelName: llm.name,
+      modelName: servedBy.name,
       inputTokens: response.inputTokens,
       outputTokens: response.outputTokens,
       costEur: cost,

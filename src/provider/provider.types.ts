@@ -12,6 +12,8 @@ export interface IPullRequest {
   sourceCommit: string;
   targetBranch: string;
   authorUsername: string;
+  /** Usernames/slugs of accounts listed as PR reviewers (provider-native, not carrot config). */
+  reviewerUsernames: string[];
 }
 
 export interface ICommentAuthor {

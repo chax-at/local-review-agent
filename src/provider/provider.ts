@@ -24,6 +24,8 @@ export interface IGitProvider {
   listProjects(): Promise<IProject[]>;
   listRepos(projectKey: string): Promise<IRepo[]>;
   listBranches(project: string, slug: string): Promise<string[]>;
+  /** Default branch name (Bitbucket "main branch"), or null when the provider can not tell. */
+  getDefaultBranch(project: string, slug: string): Promise<string | null>;
   getBranchLatestCommit(project: string, slug: string, branch: string): Promise<string | null>;
   getLatestCommitTimestampMs(project: string, slug: string): Promise<number | null>;
 

@@ -12,6 +12,7 @@ import type {
   IGitConfig,
 } from '../provider.types';
 import { GitProviderAuthError, type IGitProvider } from '../provider';
+import { encodePath } from '../encode-path';
 import { toPullRequestCloud, toCommentCloud, toBuildStatusCloud, toRepoCloud } from './cloud.mappers';
 import type {
   ICloudPagedResponse,
@@ -65,12 +66,21 @@ export class BitbucketCloudProvider implements IGitProvider {
     };
   }
 
-  /** Retries fetch on network failures (TypeError: fetch failed, ECONNRESET, etc.). */
+  /**
+   * Retries fetch on network failures (TypeError: fetch failed, ECONNRESET, etc.)
+   * AND on a 5xx response — Atlassian's own infra occasionally returns a bare
+   * `{"type":"error","error":{"message":"Something went wrong","id":"..."}}`
+   * 500 with no useful signal, and callers that only check `response.ok` (e.g.
+   * `postInlineComment`) had no other retry path, silently losing a comment.
+   * 4xx responses are returned immediately — those are real client errors
+   * (bad payload, auth, 404), not transient, and retrying wouldn't help.
+   */
   private async fetchWithNetworkRetry(url: string, init?: RequestInit): Promise<Response> {
     const maxAttempts = 4;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let response: Response;
       try {
-        return await fetch(url, init);
+        response = await fetch(url, init);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (attempt === maxAttempts - 1) {
@@ -83,7 +93,19 @@ export class BitbucketCloudProvider implements IGitProvider {
           TraceTags.BITBUCKET,
         );
         await new Promise((r) => setTimeout(r, waitMs));
+        continue;
       }
+
+      // `>=` (not `<`) so an undefined/NaN status from an incomplete mock never retries.
+      if (!(response.status >= 500) || attempt === maxAttempts - 1) {
+        return response;
+      }
+      const waitMs = Math.pow(2, attempt) * 1000;
+      LogSink.warn(
+        `Bitbucket Cloud returned ${response.status}, retry in ${waitMs}ms (attempt ${attempt + 1}/${maxAttempts})`,
+        TraceTags.BITBUCKET,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
     }
     throw new Error('Bitbucket Cloud fetchWithNetworkRetry: unreachable');
   }
@@ -140,6 +162,19 @@ export class BitbucketCloudProvider implements IGitProvider {
       `${API_BASE}/repositories/${this.workspace}/${slug}/refs/branches`,
     );
     return branches.map((b) => b.name);
+  }
+
+  public async getDefaultBranch(_project: string, slug: string): Promise<string | null> {
+    try {
+      const response = await this.fetchWithNetworkRetry(`${API_BASE}/repositories/${this.workspace}/${slug}`, {
+        headers: this.headers,
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as { mainbranch?: { name?: string } };
+      return data.mainbranch?.name ?? null;
+    } catch {
+      return null;
+    }
   }
 
   public async getBranchLatestCommit(_project: string, slug: string, branch: string): Promise<string | null> {
@@ -344,10 +379,7 @@ export class BitbucketCloudProvider implements IGitProvider {
     opts?: { at?: string; quiet?: boolean },
   ): Promise<string | null> {
     const ref = opts?.at ?? 'HEAD';
-    const url = `${API_BASE}/repositories/${this.workspace}/${slug}/src/${encodeURIComponent(ref)}/${filePath}`.replace(
-      /%2F/g,
-      '/',
-    );
+    const url = `${API_BASE}/repositories/${this.workspace}/${slug}/src/${encodePath(ref)}/${encodePath(filePath)}`;
     if (!opts?.quiet) {
       LogSink.debug(`Bitbucket Cloud API: GET file ${filePath} (ref=${ref})`, TraceTags.BITBUCKET);
     }

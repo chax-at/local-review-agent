@@ -12,6 +12,7 @@ import type {
   IGitConfig,
 } from '../provider.types';
 import { GitProviderAuthError, type IGitProvider } from '../provider';
+import { encodePath } from '../encode-path';
 import type {
   IBitbucketPullRequest,
   IBitbucketPagedResponse,
@@ -65,12 +66,20 @@ export class BitbucketServerProvider implements IGitProvider {
     return `${this.baseUrl}/rest/api/1.0/projects/${project}/repos/${slug}`;
   }
 
-  /** Retries fetch on network failures (TypeError: fetch failed, ECONNRESET, etc.). */
+  /**
+   * Retries fetch on network failures (TypeError: fetch failed, ECONNRESET, etc.)
+   * AND on a 5xx response — a transient server-side error with no useful signal,
+   * and callers that only check `response.ok` (e.g. `postInlineComment`) had no
+   * other retry path, silently losing a comment. 4xx responses are returned
+   * immediately — those are real client errors (bad payload, auth, 404), not
+   * transient, and retrying wouldn't help.
+   */
   private async fetchWithNetworkRetry(url: string, init?: RequestInit): Promise<Response> {
     const maxAttempts = 4;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let response: Response;
       try {
-        return await fetch(url, init);
+        response = await fetch(url, init);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (attempt === maxAttempts - 1) {
@@ -83,7 +92,19 @@ export class BitbucketServerProvider implements IGitProvider {
           TraceTags.BITBUCKET,
         );
         await new Promise((r) => setTimeout(r, waitMs));
+        continue;
       }
+
+      // `>=` (not `<`) so an undefined/NaN status from an incomplete mock never retries.
+      if (!(response.status >= 500) || attempt === maxAttempts - 1) {
+        return response;
+      }
+      const waitMs = Math.pow(2, attempt) * 1000;
+      LogSink.warn(
+        `Bitbucket returned ${response.status}, retry in ${waitMs}ms (attempt ${attempt + 1}/${maxAttempts})`,
+        TraceTags.BITBUCKET,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
     }
     throw new Error('Bitbucket fetchWithNetworkRetry: unreachable');
   }
@@ -140,6 +161,19 @@ export class BitbucketServerProvider implements IGitProvider {
   public async listBranches(project: string, slug: string): Promise<string[]> {
     const branches = await this.fetchAllPages<{ displayId: string }>(`${this.repoApi(project, slug)}/branches`);
     return branches.map((b) => b.displayId);
+  }
+
+  public async getDefaultBranch(project: string, slug: string): Promise<string | null> {
+    try {
+      const response = await this.fetchWithNetworkRetry(`${this.repoApi(project, slug)}/branches/default`, {
+        headers: this.headers,
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as { displayId?: string };
+      return data.displayId ?? null;
+    } catch {
+      return null;
+    }
   }
 
   public async getBranchLatestCommit(project: string, slug: string, branch: string): Promise<string | null> {
@@ -385,19 +419,38 @@ export class BitbucketServerProvider implements IGitProvider {
     opts?: { at?: string; quiet?: boolean },
   ): Promise<string | null> {
     const branch = opts?.at;
-    let url = `${this.repoApi(project, slug)}/browse/${filePath}`;
-    if (branch) url += `?at=${encodeURIComponent(branch)}`;
+    const url = `${this.repoApi(project, slug)}/browse/${encodePath(filePath)}`;
+    const atParam = branch ? `at=${encodeURIComponent(branch)}&` : '';
     if (!opts?.quiet) {
       LogSink.debug(`Bitbucket API: GET file ${filePath} (branch=${branch ?? 'default'})`, TraceTags.BITBUCKET);
     }
     try {
-      const response = await this.fetchWithNetworkRetry(url, {
-        headers: { ...this.headers, Accept: 'application/json' },
-      });
-      if (!response.ok) return null;
-      const data = (await response.json()) as { lines?: { text: string }[] };
-      if (!data.lines) return null;
-      return data.lines.map((l) => l.text).join('\n');
+      // /browse returns the file as pages of lines; read them all, or a large
+      // file is cut off after the first page.
+      const lines: string[] = [];
+      let start: number | undefined = 0;
+      while (start !== undefined) {
+        const response = await this.fetchWithNetworkRetry(`${url}?${atParam}start=${start}`, {
+          headers: { ...this.headers, Accept: 'application/json' },
+        });
+        if (!response.ok) return null;
+        const data = (await response.json()) as {
+          lines?: { text: string }[];
+          isLastPage?: boolean;
+          nextPageStart?: number;
+        };
+        if (!data.lines) return null;
+        lines.push(...data.lines.map((l) => l.text));
+        if (data.isLastPage !== false) {
+          start = undefined;
+        } else if (typeof data.nextPageStart === 'number' && data.nextPageStart > start) {
+          start = data.nextPageStart;
+        } else {
+          // More pages, but no way forward: the content would be incomplete.
+          return null;
+        }
+      }
+      return lines.join('\n');
     } catch {
       return null;
     }

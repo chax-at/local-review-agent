@@ -8,6 +8,7 @@ describe('SCANNER_ELIGIBLE_PERSONAS', () => {
     expect(SCANNER_ELIGIBLE_PERSONAS.has('correctness')).toBe(false);
     expect(SCANNER_ELIGIBLE_PERSONAS.has('readability')).toBe(false);
     expect(SCANNER_ELIGIBLE_PERSONAS.has('vegetable-police')).toBe(false);
+    expect(SCANNER_ELIGIBLE_PERSONAS.has('ai-generated-code')).toBe(false);
   });
 });
 
@@ -24,6 +25,7 @@ describe('scannerFindingsForRole', () => {
     expect(scannerFindingsForRole('correctness', '## Semgrep\n- finding')).toBeNull();
     expect(scannerFindingsForRole('readability', '## Semgrep\n- finding')).toBeNull();
     expect(scannerFindingsForRole('vegetable-police', '## Semgrep\n- finding')).toBeNull();
+    expect(scannerFindingsForRole('ai-generated-code', '## Semgrep\n- finding')).toBeNull();
   });
 
   it('returns null when there are no scanner findings at all', () => {

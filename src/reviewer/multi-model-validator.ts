@@ -3,6 +3,7 @@ import type { IReviewFinding, IModelUsage, IAuthoredFinding } from '../types';
 import LogSink from '@chax-at/log-sink';
 import { TraceTags } from '../log/tags';
 import { extractAddedLines } from './diff.utils';
+import type { IPiVerificationEntry } from './pi.service';
 import {
   FindingsValidationSchema,
   FindingsValidationWithInfoSchema,
@@ -14,6 +15,7 @@ import {
   textFixProposalsJsonSchema,
   parseWithSchema,
 } from './llm-schemas';
+import { LINTER_TONE } from './personas';
 
 /**
  * A proposed inline ` ```suggestion ` edit for one finding: either a `replace`
@@ -121,6 +123,50 @@ export function formatValidationNotes(entries: IVoteEntry[]): string {
 }
 
 /**
+ * Callback the validator uses to ground contested (split-vote) findings
+ * against the real code via pi before a judge decides. `splitIndices` are
+ * indices into `findings`; the returned map is keyed by those same global
+ * indices — the callback remaps pi's own 0..N-1 local indexing back before
+ * returning (mirroring how `IFollowUpInfoGatherer` groups by file rather than
+ * exposing an internal indexing scheme to the validator).
+ */
+export type IPiVerifier = (
+  findings: IAuthoredFinding[],
+  splitIndices: number[],
+) => Promise<{
+  results: Map<number, IPiVerificationEntry>;
+  usage: IModelUsage[];
+  /** Which model ran pi for this verification call. Null when verification didn't run (no primary review model). */
+  modelName: string | null;
+}>;
+
+/**
+ * Render a judge's final decision for a pi-grounded split finding: the same
+ * round-1 vote summary `formatValidationNotes` produces, plus (when available)
+ * the evidence pi found by checking the real code, plus the judge's own
+ * one-line rationale. Replaces the round-2 vote summary for findings judged
+ * this way — see `MultiModelValidator.judgeWithPiEvidence`.
+ */
+export function formatJudgedValidationNotes(
+  round1Entries: IVoteEntry[],
+  piEvidence: IPiVerificationEntry | undefined,
+  judgeThought: string,
+  judgeName: string,
+  /** Which model ran pi for this verification (`reviewModels[0]`, not configurable per role). Null when unknown. */
+  piModelName: string | null,
+): string {
+  const blocks: string[] = [];
+  const base = formatValidationNotes(round1Entries);
+  if (base) blocks.push(base);
+  if (piEvidence) {
+    const piLabel = piModelName ? `pi (${piModelName})` : 'pi';
+    blocks.push(`**${piLabel} verified against the code:** ${piEvidence.evidence}`);
+  }
+  blocks.push(`**${judgeName} says:** ${judgeThought}`);
+  return blocks.join('\n\n');
+}
+
+/**
  * Pick up to `n` random items from `items`, without replacement, preserving
  * the original items as-is (no deep clone). Returns a fresh array. When
  * `n <= 0` or `items.length <= n`, returns all items in a shallow copy
@@ -150,8 +196,43 @@ function isAuthoredBy(finding: IAuthoredFinding, modelName: string): boolean {
   return finding.author === modelName;
 }
 
+/** Reviewers describe the problem only (see buildReviewPrompt), so the vote,
+ *  deliberation and judge prompts must not treat a finding without a fix as noise. */
+export const NO_FIX_NEEDED =
+  'A finding does not need a suggested fix. Pointing at the problem is enough — the developer decides how to ' +
+  'address it.';
+
+const JUDGE_SYSTEM_PROMPT = [
+  'You are the final judge on code review findings where reviewers disagreed.',
+  "For each finding you get the reviewers' round-1 votes and reasoning, and — when available — evidence",
+  "gathered by inspecting the real repository to check whether the finding's claim holds up.",
+  "Weigh the code evidence more heavily than opinion alone: if it contradicts a reviewer's claim, side with the evidence.",
+  'When codeSupportsClaim is null, no grounding evidence was available; decide from the file context and the',
+  "reviewers' reasoning alone.",
+  'A finding is worth posting if it is a REAL issue the developer should act on.',
+  'Do not dismiss findings just because the fix is small — misleading comments, stale TODOs that contradict the',
+  'actual code, and factually wrong documentation ARE real issues.',
+  NO_FIX_NEEDED,
+  LINTER_TONE,
+  'Return JSON: { "results": [{ "index": 0, "relevant": true/false, "thought": "..." }, ...] }',
+].join('\n');
+
 export class MultiModelValidator {
-  constructor(private readonly models: LlmClient[]) {}
+  constructor(
+    private readonly models: LlmClient[],
+    /**
+     * Fixed round-2 judge, set by `REVIEW_JUDGE_MODEL_SLOT`. When unset,
+     * `judgeWithPiEvidence` falls back to `this.models[0]` (today's default —
+     * whichever model landed first after `withRandomSubset`'s shuffle).
+     */
+    private readonly judgeModel: LlmClient | null = null,
+    /**
+     * When true (`REVIEW_ALWAYS_JUDGE`), every finding that round 1 didn't
+     * unanimously reject — not just split-vote ones — is sent to the round-2
+     * judge for a final decision before it can be posted.
+     */
+    private readonly alwaysJudge: boolean = false,
+  ) {}
 
   public get hasModels(): boolean {
     return this.models.length > 0;
@@ -177,7 +258,7 @@ export class MultiModelValidator {
   public withRandomSubset(n: number, deprioritizeNames: string[] = []): MultiModelValidator {
     if (n <= 0) return this;
     if (deprioritizeNames.length === 0) {
-      return new MultiModelValidator(pickRandom(this.models, n));
+      return new MultiModelValidator(pickRandom(this.models, n), this.judgeModel, this.alwaysJudge);
     }
     const deprioritized = new Set(deprioritizeNames);
     const preferred = this.models.filter((m) => !deprioritized.has(m.name));
@@ -186,7 +267,7 @@ export class MultiModelValidator {
       const fallback = this.models.filter((m) => deprioritized.has(m.name));
       picked.push(...pickRandom(fallback, n - picked.length));
     }
-    return new MultiModelValidator(picked);
+    return new MultiModelValidator(picked, this.judgeModel, this.alwaysJudge);
   }
 
   public async validateFindings(
@@ -196,6 +277,7 @@ export class MultiModelValidator {
     existingComments?: string[],
     additionalContextByFile?: Map<string, string>,
     followUpGather?: IFollowUpInfoGatherer,
+    piVerify?: IPiVerifier,
   ): Promise<IValidationResult> {
     if (findings.length === 0 || this.models.length === 0) {
       return {
@@ -219,28 +301,43 @@ export class MultiModelValidator {
 
     const unanimous: IValidatedFinding[] = [];
     const splitIndices: number[] = [];
+    // Only populated when `alwaysJudge` is set: unanimous-accept / no-vote
+    // findings that would otherwise post directly, but must still clear the
+    // round-2 judge first.
+    const acceptedIndices: number[] = [];
     let discardedRound1 = 0;
 
     for (let i = 0; i < findings.length; i++) {
       const votes = round1Votes.get(i);
       const notes = votes ? formatValidationNotes(votes.entries) : '';
-      if (!votes || votes.totalResponses === 0) {
-        unanimous.push({ ...findings[i], validationNotes: notes });
-      } else if (votes.votes === votes.totalResponses) {
-        unanimous.push({ ...findings[i], validationNotes: notes });
-      } else if (votes.votes === 0) {
+      if (votes && votes.totalResponses > 0 && votes.votes === 0) {
         LogSink.debug(`Finding ${i} filtered (round 1): all voters say noise`, TraceTags.PI);
         discardedRound1++;
+      } else if (!votes || votes.totalResponses === 0 || votes.votes === votes.totalResponses) {
+        if (this.alwaysJudge) {
+          acceptedIndices.push(i);
+        } else {
+          unanimous.push({ ...findings[i], validationNotes: notes });
+        }
       } else {
         splitIndices.push(i);
       }
     }
 
-    if (splitIndices.length === 0) {
+    // Round-2 candidates: split-vote findings always go, and — under
+    // `alwaysJudge` — every finding round 1 didn't unanimously reject.
+    const judgeIndices = this.alwaysJudge ? [...acceptedIndices, ...splitIndices] : splitIndices;
+
+    if (judgeIndices.length === 0) {
       return { findings: unanimous, usage: allUsage, discardedRound1, discardedRound2: 0 };
     }
 
-    LogSink.info(`${splitIndices.length} finding(s) have split votes, running deliberation round`, TraceTags.PI);
+    LogSink.info(
+      this.alwaysJudge
+        ? `Round 2 (always-on): judging ${judgeIndices.length} finding(s) (${splitIndices.length} split vote, ${acceptedIndices.length} unanimous)`
+        : `${splitIndices.length} finding(s) have split votes, running deliberation round`,
+      TraceTags.PI,
+    );
 
     // Between rounds, harvest "I need more context" requests from the round-1
     // votes on the contested findings, group them by the finding's file, and
@@ -249,7 +346,7 @@ export class MultiModelValidator {
     // separate budget — same cap).
     let mergedContextByFile = new Map<string, string>(additionalContextByFile ?? []);
     if (followUpGather) {
-      const requestsByFile = this.collectInfoRequestsByFile(findings, round1Votes, splitIndices);
+      const requestsByFile = this.collectInfoRequestsByFile(findings, round1Votes, judgeIndices);
       if (requestsByFile.size > 0) {
         try {
           const follow = await followUpGather(requestsByFile);
@@ -268,15 +365,26 @@ export class MultiModelValidator {
       }
     }
 
-    const { kept: deliberated, discarded: discardedRound2 } = await this.deliberate(
-      findings,
-      diffContext,
-      fileContentByPath,
-      splitIndices,
-      round1Votes,
-      allUsage,
-      mergedContextByFile,
-    );
+    const { kept: deliberated, discarded: discardedRound2 } = piVerify
+      ? await this.judgeWithPiEvidence(
+          findings,
+          diffContext,
+          fileContentByPath,
+          judgeIndices,
+          round1Votes,
+          allUsage,
+          mergedContextByFile,
+          piVerify,
+        )
+      : await this.deliberate(
+          findings,
+          diffContext,
+          fileContentByPath,
+          judgeIndices,
+          round1Votes,
+          allUsage,
+          mergedContextByFile,
+        );
 
     return {
       findings: [...unanimous, ...deliberated],
@@ -406,12 +514,12 @@ export class MultiModelValidator {
       'You are a senior code reviewer validating automated findings.',
       'For EACH finding, decide if it is genuinely worth flagging.',
       'A finding is worth posting if it is a real issue — be strict about noise, but do not',
-      'dismiss findings that point out genuinely misleading or factually wrong information',
-      'when the finding also provides a concrete fix (e.g. replacement text or clear action).',
+      'dismiss findings that point out genuinely misleading or factually wrong information.',
       'Stale TODOs, comments that contradict the actual code, and misleading documentation',
-      'ARE real issues when a fix is included — they waste future readers\u2019 time and cause',
-      'incorrect assumptions. Without a suggested fix, they are just observation noise.',
+      'ARE real issues — they waste future readers\u2019 time and cause incorrect assumptions.',
+      NO_FIX_NEEDED,
       'Add a brief thought (1 sentence) explaining WHY it matters or why it is noise.',
+      LINTER_TONE,
       '',
       'You may also request ADDITIONAL CONTEXT via the `infoRequest` field. If the',
       'evidence in front of you is insufficient to judge a finding confidently,',
@@ -538,8 +646,9 @@ export class MultiModelValidator {
       'Read their reasoning carefully, then make your final decision.',
       'A finding is worth posting if it is a REAL issue that the developer should act on.',
       'Do not dismiss findings just because the fix is small — misleading comments, stale TODOs',
-      'that contradict actual code, and factually wrong documentation ARE real issues, but only',
-      'when the finding includes a concrete suggested fix. Without one, treat them as noise.',
+      'that contradict actual code, and factually wrong documentation ARE real issues.',
+      NO_FIX_NEEDED,
+      LINTER_TONE,
       'Return JSON: { "results": [{ "index": 0, "relevant": true/false, "thought": "..." }, ...] }',
     ].join('\n');
 
@@ -616,6 +725,136 @@ export class MultiModelValidator {
         discarded++;
       } else {
         kept.push({ ...findings[idx], validationNotes: formatValidationNotes(allEntries) });
+      }
+    }
+
+    return { kept, discarded };
+  }
+
+  /**
+   * Replaces round 2 for contested findings when the caller supplies
+   * `piVerify`: pi checks each finding against the real code, then one judge
+   * model reads the finding, its round-1 votes, and pi's evidence, and
+   * decides directly — no revote, no unanimous-reject counting. The judge is
+   * `this.judgeModel` when `REVIEW_JUDGE_MODEL_SLOT` pins one; otherwise
+   * `this.models[0]` (today's default).
+   */
+  private async judgeWithPiEvidence(
+    findings: IAuthoredFinding[],
+    diffContext: string,
+    fileContentByPath: Map<string, string>,
+    judgeIndices: number[],
+    round1Votes: Map<number, IFindingVote>,
+    usageOut: IModelUsage[],
+    additionalContextByFile: Map<string, string> | undefined,
+    piVerify: IPiVerifier,
+  ): Promise<{ kept: IValidatedFinding[]; discarded: number }> {
+    let piResults = new Map<number, IPiVerificationEntry>();
+    let piModelName: string | null = null;
+    try {
+      const verification = await piVerify(findings, judgeIndices);
+      piResults = verification.results;
+      piModelName = verification.modelName;
+      usageOut.push(...verification.usage);
+    } catch (err) {
+      LogSink.warn(`Pi verification failed, judging on round-1 votes alone: ${err}`, TraceTags.PI);
+    }
+
+    const groups = this.buildValidationGroups(
+      findings,
+      judgeIndices,
+      fileContentByPath,
+      diffContext,
+      additionalContextByFile,
+    );
+
+    const kept: IValidatedFinding[] = [];
+    let discarded = 0;
+    const judge = this.judgeModel ?? this.models[0];
+
+    for (const group of groups) {
+      const keepConservatively = (indices: number[]): void => {
+        for (const gi of indices) {
+          kept.push({ ...findings[gi], validationNotes: formatValidationNotes(round1Votes.get(gi)?.entries ?? []) });
+        }
+      };
+
+      // The judge is a single model, unlike round 1/2 where excluding the
+      // author still leaves other voters. Here there is no one else to ask,
+      // so a finding the judge itself authored can't be judged independently
+      // — conservatively keep it instead (same "no independent voter
+      // available" philosophy as the sole-validator-is-author case above).
+      const judgeable = group.indices.filter((gi) => !isAuthoredBy(findings[gi], judge.name));
+      const selfAuthored = group.indices.filter((gi) => isAuthoredBy(findings[gi], judge.name));
+      keepConservatively(selfAuthored);
+
+      if (judgeable.length === 0) continue;
+
+      try {
+        const items = judgeable.map((gi, local) => {
+          const evidence = piResults.get(gi);
+          return {
+            index: local,
+            file: findings[gi].filePath,
+            line: findings[gi].line,
+            severity: findings[gi].severity,
+            comment: findings[gi].comment,
+            previousReviews: renderEntriesForPrompt(round1Votes.get(gi)?.entries ?? []),
+            codeEvidence: evidence ? evidence.evidence : '(no grounding evidence available)',
+            codeSupportsClaim: evidence ? evidence.supported : null,
+          };
+        });
+
+        const userMessage = [
+          group.context,
+          `## Contested findings (reviewers disagreed):\n${JSON.stringify(items, null, 2)}`,
+        ].join('\n');
+
+        const response = await judge.chat(JUDGE_SYSTEM_PROMPT, userMessage, {
+          jsonMode: true,
+          jsonSchema: findingsValidationJsonSchema,
+        });
+        usageOut.push(this.trackUsage(judge, response));
+
+        const parsed = parseWithSchema(response.content, FindingsValidationSchema);
+        if (!parsed) {
+          LogSink.warn(`Judge returned unparseable response, keeping this group's findings conservatively`, TraceTags.PI);
+          keepConservatively(judgeable);
+          continue;
+        }
+
+        const decided = new Set<number>();
+        for (const r of parsed.results) {
+          if (!Number.isInteger(r.index) || r.index < 0 || r.index >= judgeable.length) continue;
+          if (decided.has(r.index)) continue;
+          decided.add(r.index);
+          const gi = judgeable[r.index];
+          if (r.relevant) {
+            kept.push({
+              ...findings[gi],
+              validationNotes: formatJudgedValidationNotes(
+                round1Votes.get(gi)?.entries ?? [],
+                piResults.get(gi),
+                r.thought,
+                judge.name,
+                piModelName,
+              ),
+            });
+          } else {
+            LogSink.debug(`Finding ${gi} discarded by judge: ${r.thought}`, TraceTags.PI);
+            discarded++;
+          }
+        }
+        // Any finding the judge's response omitted: conservative keep, same
+        // fail-safe philosophy as "no votes = keep" elsewhere in this file.
+        for (let local = 0; local < judgeable.length; local++) {
+          if (decided.has(local)) continue;
+          const gi = judgeable[local];
+          kept.push({ ...findings[gi], validationNotes: formatValidationNotes(round1Votes.get(gi)?.entries ?? []) });
+        }
+      } catch (err) {
+        LogSink.warn(`Judge call failed, keeping this group's findings conservatively: ${err}`, TraceTags.PI);
+        keepConservatively(judgeable);
       }
     }
 

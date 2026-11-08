@@ -55,4 +55,36 @@ describe('StateService', () => {
     const files = fs.readdirSync(tmpDir);
     expect(files.filter(f => f.endsWith('.tmp'))).toHaveLength(0);
   });
+
+  it('stores and reloads ticket state', () => {
+    stateService.load();
+    stateService.setTicketState('ABC-1', {
+      repoKey: 'P/r',
+      branch: 'feature/ABC-1-x',
+      attempts: 1,
+      lastCommentId: 10,
+      lastRunAt: '2026-09-11T10:00:00Z',
+    });
+    stateService.save();
+
+    const fresh = new StateService(tmpDir);
+    fresh.load();
+    expect(fresh.getTicketState('ABC-1')?.branch).toBe('feature/ABC-1-x');
+    expect(fresh.getTicketState('ZZZ-9')).toBeUndefined();
+  });
+
+  it('prunes ticket entries older than the window and keeps recent ones', () => {
+    stateService.load();
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    stateService.setTicketState('ABC-1', { repoKey: 'P/r', attempts: 0, lastCommentId: 0, lastRunAt: old });
+    stateService.setTicketState('ABC-2', {
+      repoKey: 'P/r',
+      attempts: 0,
+      lastCommentId: 0,
+      lastRunAt: new Date().toISOString(),
+    });
+    stateService.pruneStale(30);
+    expect(stateService.getTicketState('ABC-1')).toBeUndefined();
+    expect(stateService.getTicketState('ABC-2')).toBeDefined();
+  });
 });

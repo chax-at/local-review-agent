@@ -26,6 +26,7 @@ export interface IBitbucketPullRequest {
   author: {
     user: { slug: string };
   };
+  reviewers?: Array<{ user: { slug: string } }>;
 }
 
 export interface IBitbucketPagedResponse<T> {

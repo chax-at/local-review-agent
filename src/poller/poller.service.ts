@@ -5,9 +5,11 @@ import { TraceTags } from '../log/tags';
 import type { IGitProvider } from '../provider/provider';
 import { GitProviderAuthError } from '../provider/provider';
 import type { IPullRequest } from '../provider/provider.types';
+import type { IPrState } from '../types';
 import { StateService } from './state.service';
 import { ReviewerService } from '../reviewer/reviewer.service';
 import { CarrotConfigService } from '../config/carrot-config.service';
+import { CARROT_CONFIG_DEFAULTS } from '../config/carrot-config.types';
 import { GitService } from '../reviewer/git.service';
 import type { IMentionCommand } from '../types';
 import { REPO_ACTIVITY_WINDOW_MS, repoHasRecentActivity } from './repo-activity';
@@ -24,6 +26,8 @@ import { MentionRouter } from './mention-router';
 import { executeMentionTool } from './mention-executor';
 import { buildMentionContext, sliceCodeAroundLine, type IMentionContext } from './mention-context';
 import type { ICarrotConfig } from '../config/carrot-config.types';
+import { shutdownInstrumentation } from '../instrumentation/instrumentation';
+import { ATTR_VCS_CHANGE_ID, ATTR_VCS_REPOSITORY_NAME, runInRootSpan } from '../instrumentation/tracing';
 
 /**
  * How many times a failing auto-review is retried (one attempt per poll cycle)
@@ -35,6 +39,10 @@ import type { ICarrotConfig } from '../config/carrot-config.types';
  */
 export const MAX_AUTO_REVIEW_ATTEMPTS = 3;
 
+/** Union of processed mention ids, oldest first, capped to the newest 200. */
+const mergeProcessedIds = (previous: number[], added: number[]): number[] =>
+  [...new Set([...previous, ...added])].slice(-200);
+
 export class PollerService {
   private readonly provider: IGitProvider;
   private readonly state: StateService;
@@ -45,6 +53,7 @@ export class PollerService {
   private readonly botUsername: string;
   private readonly intervalMs: number;
   private readonly heartbeat: () => void;
+  private readonly ticketService: { pollTickets(): Promise<void> } | null;
   private shutdownRequested = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -58,6 +67,8 @@ export class PollerService {
     botUsername: string,
     intervalMs: number,
     heartbeat: () => void,
+    /** Flow 4. null when Jira or the implement model is not configured. */
+    ticketService: { pollTickets(): Promise<void> } | null = null,
   ) {
     this.provider = provider;
     this.state = state;
@@ -68,6 +79,7 @@ export class PollerService {
     this.botUsername = botUsername;
     this.intervalMs = intervalMs;
     this.heartbeat = heartbeat;
+    this.ticketService = ticketService;
   }
 
   public async start(): Promise<void> {
@@ -100,7 +112,16 @@ export class PollerService {
   }
 
   private async runOneCycle(): Promise<void> {
-    await this.pollCycle();
+    try {
+      await runInRootSpan('poll cycle', {}, () => this.pollCycle());
+    } catch (err) {
+      if (err instanceof GitProviderAuthError) {
+        // The ended poll cycle span has the error status, so the shutdown exports its trace
+        await shutdownInstrumentation();
+        process.exit(1);
+      }
+      throw err;
+    }
   }
 
   private async pollCycle(): Promise<void> {
@@ -111,6 +132,15 @@ export class PollerService {
     this.carrotConfig.clearCache();
     this.git.resetFetchMemo();
     this.state.pruneStale(30);
+
+    // ── Ticket phase (Flow 4) — before PRs, so a PR it opens is reviewed this cycle ──
+    if (this.ticketService) {
+      try {
+        await this.ticketService.pollTickets();
+      } catch (err) {
+        LogSink.error(`Ticket phase failed: ${err}`, TraceTags.POLLER);
+      }
+    }
 
     // ── Discover repos and poll PRs ──
     try {
@@ -133,8 +163,7 @@ export class PollerService {
             await this.pollRepo(project.key, repo.slug, prs);
           } catch (err) {
             if (err instanceof GitProviderAuthError) {
-              LogSink.error(`Auth failed: ${err.message}. Halting.`, TraceTags.POLLER);
-              process.exit(1);
+              throw err;
             }
             LogSink.error(`Failed to poll ${project.key}/${repo.slug}: ${err}`, TraceTags.POLLER);
           }
@@ -153,7 +182,8 @@ export class PollerService {
     } catch (err) {
       if (err instanceof GitProviderAuthError) {
         LogSink.error(`Auth failed: ${err.message}. Halting.`, TraceTags.POLLER);
-        process.exit(1);
+        // runOneCycle exits after the poll cycle span has ended
+        throw err;
       }
       LogSink.error(`Poll cycle failed: ${err}`, TraceTags.POLLER);
     }
@@ -171,6 +201,11 @@ export class PollerService {
     LogSink.info('Poll cycle complete.', TraceTags.POLLER);
   }
 
+  /** Whether the bot's own account is listed as a PR reviewer (Bitbucket-native signal, not carrot config). */
+  private isBotReviewer(pr: IPullRequest): boolean {
+    return (pr.reviewerUsernames ?? []).includes(this.botUsername);
+  }
+
   private async pollRepo(project: string, slug: string, prs: IPullRequest[]): Promise<void> {
     const repoKey = `${project}/${slug}`;
 
@@ -178,18 +213,25 @@ export class PollerService {
 
     // Only fetch the chaxy config if repo has open PRs
     const carrotConf = await this.carrotConfig.getConfig(project, slug);
+
+    // A repo with no chaxy config never opted in, so it's normally skipped
+    // entirely — no mentions, no auto-review. But someone adding the bot's
+    // own account as a PR reviewer is itself an explicit, per-PR opt-in
+    // signal from Bitbucket, so that PR still gets an auto-review attempt
+    // (and an explanation if it fails) even with zero config. Scoped
+    // narrowly: only auto-review runs here, never mention dispatch — those
+    // need rulesFiles/dockerImage context this repo never supplied.
     if (!carrotConf) {
+      await this.pollReviewerTriggeredOnly(project, slug, repoKey, prs);
       return;
     }
 
     LogSink.info(`Polling ${repoKey} (${prs.length} open PR(s))...`, TraceTags.POLLER);
 
-    // Filter out drafts, bot-authored PRs, and bot-branched PRs.
+    // Filter out bot-authored and bot-branched PRs. Drafts stay eligible so
+    // @mentions still reach them — auto-review below is gated on draft instead.
     const eligiblePrs = prs.filter(
-      (pr) =>
-        !pr.draft &&
-        pr.authorUsername !== this.botUsername &&
-        !BOT_BRANCH_PREFIXES.some((p) => pr.sourceBranch.startsWith(p)),
+      (pr) => pr.authorUsername !== this.botUsername && !BOT_BRANCH_PREFIXES.some((p) => pr.sourceBranch.startsWith(p)),
     );
 
     const prStateParts: string[] = [];
@@ -207,7 +249,7 @@ export class PollerService {
         prStateParts.push(`#${pr.id}:${synced ? 'synced' : 'behind'}`);
 
         // ── Mention detection ──
-        const { mentions, newProcessedIds } = await this.checkMentions(
+        const { mentions, newProcessedIds, maxActivityId } = await this.checkMentions(
           project,
           slug,
           pr.id,
@@ -217,7 +259,11 @@ export class PollerService {
 
         for (const mention of mentions) {
           try {
-            await this.dispatchMention(mention, project, slug, pr, carrotConf);
+            await runInRootSpan(
+              'PR mention',
+              { [ATTR_VCS_REPOSITORY_NAME]: repoKey, [ATTR_VCS_CHANGE_ID]: pr.id },
+              () => this.dispatchMention(mention, project, slug, pr, carrotConf),
+            );
           } catch (err) {
             // dispatchMention has already posted ❌ Failed: <err> to the user
             // before re-throwing. We catch here so a single mention failure
@@ -231,49 +277,11 @@ export class PollerService {
         }
 
         // ── Auto-review (first time only) ──
-        // Retries on failure, at most MAX_AUTO_REVIEW_ATTEMPTS times (each retry
-        // costs a full review's LLM spend). The failure comment is updated
-        // in-place each attempt, no spam. lastReviewedCommit === '' marks
-        // "seen but not yet successfully reviewed".
-        const reviewFailures = prState?.reviewFailures ?? 0;
-        if (carrotConf.prReview && !prState?.lastReviewedCommit && reviewFailures < MAX_AUTO_REVIEW_ATTEMPTS) {
-          try {
-            await this.reviewer.reviewPr(
-              project,
-              slug,
-              pr.id,
-              pr.targetBranch,
-              pr.sourceBranch,
-              carrotConf.dockerImage,
-              carrotConf.rulesFiles,
-              carrotConf.generateFixPrompts,
-              latestCommit,
-              true, // auto-review: skip if a bot review for this commit is already on the PR
-            );
-          } catch (err) {
-            // Record the failed attempt so the retry loop is bounded. Keep the
-            // mention watermark and processed IDs as they were; leave
-            // lastReviewedCommit empty so the next cycle retries (until cap).
-            this.state.setPrState(repoKey, String(pr.id), {
-              lastReviewedCommit: '',
-              lastCheckedAt: new Date().toISOString(),
-              lastActivityId: prState?.lastActivityId ?? 0,
-              processedMentionIds: prState?.processedMentionIds,
-              reviewFailures: reviewFailures + 1,
-            });
-            // Flush immediately: the failure count must survive a restart, or a
-            // killed-and-restarted daemon would reset the retry budget and
-            // re-review (re-comment) the PR from scratch every launch.
-            this.state.save();
-            if (reviewFailures + 1 >= MAX_AUTO_REVIEW_ATTEMPTS) {
-              LogSink.warn(
-                `PR #${pr.id}: auto-review failed ${reviewFailures + 1} time(s), giving up (mention @${this.botUsername} to retry)`,
-                TraceTags.POLLER,
-              );
-            }
-            throw err;
-          }
-        }
+        // Mentions above are already dispatched; a failing review must still record them.
+        await this.autoReviewPr(project, slug, repoKey, pr, carrotConf, prState, latestCommit, {
+          newProcessedIds,
+          maxActivityId,
+        });
 
         await this.updatePrState(
           project,
@@ -281,6 +289,7 @@ export class PollerService {
           repoKey,
           pr,
           latestCommit,
+          prState?.lastReviewedCommit,
           prState?.processedMentionIds ?? [],
           newProcessedIds,
         );
@@ -298,6 +307,144 @@ export class PollerService {
 
     if (prStateParts.length > 0) {
       LogSink.debug(`${repoKey} PR state: ${prStateParts.join(', ')}`, TraceTags.POLLER);
+    }
+  }
+
+  /**
+   * Repos with no chaxy config are normally skipped entirely (see `pollRepo`).
+   * This is the one exception: PRs where the bot's account is explicitly
+   * listed as a reviewer still get an auto-review attempt, using built-in
+   * defaults (no dockerImage override, default rulesFiles) since there's no
+   * config to read. No mention dispatch — that needs config context this
+   * repo never supplied.
+   */
+  private async pollReviewerTriggeredOnly(
+    project: string,
+    slug: string,
+    repoKey: string,
+    prs: IPullRequest[],
+  ): Promise<void> {
+    const reviewerTriggeredPrs = prs.filter(
+      (pr) =>
+        pr.authorUsername !== this.botUsername &&
+        !BOT_BRANCH_PREFIXES.some((p) => pr.sourceBranch.startsWith(p)) &&
+        this.isBotReviewer(pr),
+    );
+    if (reviewerTriggeredPrs.length === 0) return;
+
+    LogSink.info(
+      `${repoKey}: no chaxy config file, but the bot is listed as reviewer on ${reviewerTriggeredPrs.length} PR(s) — ` +
+        `attempting auto-review for those only (default settings, no mentions)`,
+      TraceTags.POLLER,
+    );
+    const syntheticConf: ICarrotConfig = { ...CARROT_CONFIG_DEFAULTS, prReview: true } as ICarrotConfig;
+
+    for (const pr of reviewerTriggeredPrs) {
+      if (this.shutdownRequested) break;
+      this.heartbeat();
+
+      try {
+        const prState = this.state.getPrState(repoKey, String(pr.id));
+        const latestCommit = pr.sourceCommit;
+
+        await this.autoReviewPr(project, slug, repoKey, pr, syntheticConf, prState, latestCommit);
+
+        await this.updatePrState(
+          project,
+          slug,
+          repoKey,
+          pr,
+          latestCommit,
+          prState?.lastReviewedCommit,
+          prState?.processedMentionIds ?? [],
+          [],
+        );
+        this.state.save();
+      } catch (err) {
+        LogSink.error(`Failed to process reviewer-triggered PR #${pr.id} in ${repoKey}: ${err}`, TraceTags.POLLER);
+      }
+    }
+  }
+
+  /**
+   * Auto-review gate + retry bookkeeping for one PR, shared by the normal
+   * (config-gated) poll path and `pollReviewerTriggeredOnly`. Fires when not
+   * a draft, never yet reviewed, under the retry cap, and EITHER
+   * `carrotConf.prReview` is on OR the bot is explicitly listed as this PR's
+   * reviewer (which overrides just that one flag, not the retry cap or the
+   * draft/already-reviewed checks).
+   *
+   * Retries on failure, at most MAX_AUTO_REVIEW_ATTEMPTS times (each retry
+   * costs a full review's LLM spend). The failure comment is updated in-place
+   * each attempt, no spam. lastReviewedCommit === '' marks "seen but not yet
+   * successfully reviewed". Throws on failure (after recording the attempt)
+   * so the caller's per-PR catch can skip the rest of that PR's cycle.
+   *
+   * `dispatchedMentions` are the mentions the caller dispatched earlier in this
+   * cycle (and the highest activity id it scanned). The failure path records
+   * them, so the next cycle does not dispatch them again.
+   */
+  private async autoReviewPr(
+    project: string,
+    slug: string,
+    repoKey: string,
+    pr: IPullRequest,
+    carrotConf: ICarrotConfig,
+    prState: IPrState | undefined,
+    latestCommit: string,
+    dispatchedMentions: { newProcessedIds: number[]; maxActivityId: number } = {
+      newProcessedIds: [],
+      maxActivityId: 0,
+    },
+  ): Promise<void> {
+    const reviewFailures = prState?.reviewFailures ?? 0;
+    const autoReviewEnabled = carrotConf.prReview || this.isBotReviewer(pr);
+    if (pr.draft || !autoReviewEnabled || prState?.lastReviewedCommit || reviewFailures >= MAX_AUTO_REVIEW_ATTEMPTS) {
+      return;
+    }
+
+    const isFinalAttempt = reviewFailures + 1 >= MAX_AUTO_REVIEW_ATTEMPTS;
+    try {
+      await this.reviewer.reviewPr(
+        project,
+        slug,
+        pr.id,
+        pr.targetBranch,
+        pr.sourceBranch,
+        carrotConf.dockerImage,
+        carrotConf.rulesFiles,
+        carrotConf.generateFixPrompts,
+        latestCommit,
+        true, // auto-review: skip if a bot review for this commit is already on the PR
+        isFinalAttempt,
+      );
+    } catch (err) {
+      // Record the failed attempt so the retry loop is bounded. Add the
+      // mentions already dispatched this cycle to the processed IDs and move
+      // the watermark only up to the activities that were scanned for them;
+      // leave lastReviewedCommit empty so the next cycle retries (until cap).
+      const { newProcessedIds, maxActivityId } = dispatchedMentions;
+      this.state.setPrState(repoKey, String(pr.id), {
+        lastReviewedCommit: '',
+        lastCheckedAt: new Date().toISOString(),
+        lastActivityId: Math.max(prState?.lastActivityId ?? 0, maxActivityId),
+        processedMentionIds:
+          newProcessedIds.length > 0
+            ? mergeProcessedIds(prState?.processedMentionIds ?? [], newProcessedIds)
+            : prState?.processedMentionIds,
+        reviewFailures: reviewFailures + 1,
+      });
+      // Flush immediately: the failure count must survive a restart, or a
+      // killed-and-restarted daemon would reset the retry budget and
+      // re-review (re-comment) the PR from scratch every launch.
+      this.state.save();
+      if (isFinalAttempt) {
+        LogSink.warn(
+          `PR #${pr.id}: auto-review failed ${reviewFailures + 1} time(s), giving up (mention @${this.botUsername} to retry)`,
+          TraceTags.POLLER,
+        );
+      }
+      throw err;
     }
   }
 
@@ -373,15 +520,16 @@ export class PollerService {
     repoKey: string,
     pr: IPullRequest,
     latestCommit: string,
+    existingLastReviewedCommit: string | undefined,
     previousProcessedIds: number[],
     newProcessedIds: number[],
   ): Promise<void> {
     const activities = await this.provider.getActivities(project, slug, pr.id);
     const maxActivityId = activities.reduce((max, a) => Math.max(max, a.id), 0);
-    const allProcessed = [...new Set([...previousProcessedIds, ...newProcessedIds])].slice(-200);
+    const allProcessed = mergeProcessedIds(previousProcessedIds, newProcessedIds);
 
     this.state.setPrState(repoKey, String(pr.id), {
-      lastReviewedCommit: latestCommit,
+      lastReviewedCommit: pr.draft ? (existingLastReviewedCommit ?? '') : latestCommit,
       lastCheckedAt: new Date().toISOString(),
       lastActivityId: maxActivityId,
       processedMentionIds: allProcessed.length > 0 ? allProcessed : undefined,
@@ -394,10 +542,15 @@ export class PollerService {
     prId: number,
     lastActivityId: number,
     processedMentionIds: Set<number>,
-  ): Promise<{ mentions: IMentionCommand[]; newProcessedIds: number[] }> {
+  ): Promise<{ mentions: IMentionCommand[]; newProcessedIds: number[]; maxActivityId: number }> {
     const activities = await this.provider.getActivities(project, slug, prId);
     const mentions: IMentionCommand[] = [];
     const newProcessedIds: number[] = [];
+    // A provider can list a reply both as its own activity and nested under its
+    // thread root (Cloud: every comment is an activity). Each comment id yields
+    // one mention per cycle; the nested occurrence wins because it carries the
+    // thread's anchor and sibling replies.
+    const mentionById = new Map<number, { index: number; fromReply: boolean }>();
 
     for (const activity of activities) {
       if (!activity.comment) continue;
@@ -410,6 +563,7 @@ export class PollerService {
         anchorFile?: string;
         anchorLine?: number;
         siblingReplies: string[];
+        fromReply: boolean;
       }> = [];
 
       // Top-level comments: gate by activity ID watermark
@@ -426,6 +580,7 @@ export class PollerService {
             anchorFile: anchor?.path,
             anchorLine: anchor?.line,
             siblingReplies: replies.map((r) => r.text).filter(Boolean),
+            fromReply: false,
           });
         }
       }
@@ -450,14 +605,14 @@ export class PollerService {
               .filter((r) => r.id !== reply.id)
               .map((r) => r.text)
               .filter(Boolean),
+            fromReply: true,
           });
         }
       }
 
       // Build mentions from textsToCheck (no parsing — router decides)
       for (const item of textsToCheck) {
-        newProcessedIds.push(item.commentId);
-        mentions.push({
+        const mention: IMentionCommand = {
           type: 'reply', // placeholder — router determines actual tool
           message: item.text,
           prId,
@@ -466,11 +621,21 @@ export class PollerService {
           anchorFile: item.anchorFile,
           anchorLine: item.anchorLine,
           siblingReplies: item.siblingReplies,
-        });
+        };
+        const seen = mentionById.get(item.commentId);
+        if (!seen) {
+          mentionById.set(item.commentId, { index: mentions.length, fromReply: item.fromReply });
+          newProcessedIds.push(item.commentId);
+          mentions.push(mention);
+        } else if (item.fromReply && !seen.fromReply) {
+          mentions[seen.index] = mention;
+          seen.fromReply = true;
+        }
       }
     }
 
-    return { mentions, newProcessedIds };
+    const maxActivityId = activities.reduce((max, a) => Math.max(max, a.id), 0);
+    return { mentions, newProcessedIds, maxActivityId };
   }
 
   private async gatherMentionContext(

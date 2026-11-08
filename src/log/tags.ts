@@ -3,6 +3,7 @@ export const TraceTags = {
   POLLER: 'poller',
   REVIEWER: 'reviewer',
   BITBUCKET: 'bitbucket',
+  FORGEJO: 'forgejo',
   JIRA: 'jira',
   GIT: 'git',
   PI: 'pi',

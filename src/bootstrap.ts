@@ -3,6 +3,7 @@ import * as path from 'path';
 import LogSink from '@chax-at/log-sink';
 import config from './safe-config';
 import { TraceTags } from './log/tags';
+import { shutdownInstrumentation } from './instrumentation/instrumentation';
 import type { IGitProvider, IGitConfig } from './provider/provider';
 import { StateService } from './poller/state.service';
 import { PollerService } from './poller/poller.service';
@@ -18,9 +19,12 @@ import { SecurityScanner } from './reviewer/security-scanner';
 import { JiraService } from './jira/jira.service';
 import { createHeartbeat } from './heartbeat';
 import { FindingDeduplicator } from './reviewer/finding-deduplicator';
+import { FailureExplainer } from './reviewer/failure-explainer';
 import { CarrotConfigService } from './config/carrot-config.service';
 import { MentionRouter } from './poller/mention-router';
 import { parseRoles, isCorrectnessCovered } from './reviewer/personas';
+import { TicketService } from './tickets/ticket.service';
+import { RepoPicker } from './tickets/ticket-repo-map';
 
 export interface IBootstrapInput {
   provider: IGitProvider;
@@ -47,6 +51,8 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const maxInfoTokens = config.get('Review.MaxInfoTokens');
   const maxExplorationTokens = config.get('Review.MaxExplorationTokens');
   const maxValidators = config.get('Review.MaxValidators');
+  const alwaysJudge = config.get('Review.AlwaysJudge');
+  const judgeModelSlot = config.get('Review.JudgeModelSlot');
   const workDir = config.get('WorkDir');
   const dataDir = config.get('DataDir');
 
@@ -59,8 +65,8 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const stateService = new StateService(dataDir);
   const gitService = new GitService(workDir, gitConfig);
 
-  type ModelKey = 'Model1' | 'Model2' | 'Model3' | 'Model4';
-  const modelKeys: ModelKey[] = ['Model1', 'Model2', 'Model3', 'Model4'];
+  type ModelKey = 'Model1' | 'Model2' | 'Model3' | 'Model4' | 'Model5';
+  const modelKeys: ModelKey[] = ['Model1', 'Model2', 'Model3', 'Model4', 'Model5'];
 
   const buildLlmClient = (key: ModelKey): LlmClient | null => {
     // Skip models flagged Validate=false (e.g. responses-API codex deployments
@@ -107,8 +113,48 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     };
   };
 
-  const validators = modelKeys.map(buildLlmClient).filter(Boolean) as LlmClient[];
+  // Keep the slot each LlmClient came from so REVIEW_JUDGE_MODEL_SLOT can pin
+  // a specific model as round-2 judge, independent of the per-PR random
+  // validator subset (whose order withRandomSubset shuffles).
+  const validatorEntries = modelKeys.map((key) => ({ slot: key, client: buildLlmClient(key) }));
+  const validators = validatorEntries.map((e) => e.client).filter(Boolean) as LlmClient[];
   const reviewModels = modelKeys.map(buildReviewModel).filter(Boolean) as IReviewModel[];
+
+  const judgeModel = judgeModelSlot > 0 ? (validatorEntries[judgeModelSlot - 1]?.client ?? null) : null;
+  if (judgeModelSlot > 0 && !judgeModel) {
+    LogSink.warn(
+      `REVIEW_JUDGE_MODEL_SLOT=${judgeModelSlot} has no validator configured at that slot ` +
+        `(missing API key/base/model, or MODEL${judgeModelSlot}_VALIDATE=false) — ` +
+        `falling back to the first available validator as round-2 judge.`,
+      TraceTags.PI,
+    );
+  }
+
+  // Auxiliary single-model roles (info-gatherer, context-explorer, dedup) —
+  // let an unreliable model (e.g. a local AI) take these over, with a pinned
+  // fallback for when it fails. Default (slot unset) is today's behavior:
+  // the first available validator, no fallback.
+  const auxModelSlot = config.get('Review.AuxModelSlot');
+  const auxFallbackModelSlot = config.get('Review.AuxFallbackModelSlot');
+  const auxMaxConcurrency = config.get('Review.AuxMaxConcurrency');
+  const auxModel = auxModelSlot > 0 ? (validatorEntries[auxModelSlot - 1]?.client ?? null) : (validators[0] ?? null);
+  if (auxModelSlot > 0 && !auxModel) {
+    LogSink.warn(
+      `REVIEW_AUX_MODEL_SLOT=${auxModelSlot} has no validator configured at that slot ` +
+        `(missing API key/base/model, or MODEL${auxModelSlot}_VALIDATE=false) — ` +
+        `falling back to the first available validator for info-gather/context-explore/dedup.`,
+      TraceTags.PI,
+    );
+  }
+  const auxFallbackModel = auxFallbackModelSlot > 0 ? (validatorEntries[auxFallbackModelSlot - 1]?.client ?? null) : null;
+  if (auxFallbackModelSlot > 0 && !auxFallbackModel) {
+    LogSink.warn(
+      `REVIEW_AUX_FALLBACK_MODEL_SLOT=${auxFallbackModelSlot} has no validator configured at that slot ` +
+        `(missing API key/base/model, or MODEL${auxFallbackModelSlot}_VALIDATE=false) — ` +
+        `info-gather/context-explore/dedup will have no fallback if their model fails.`,
+      TraceTags.PI,
+    );
+  }
 
   if (reviewModels.length > 0 && !isCorrectnessCovered(reviewModels.map((m) => m.roles))) {
     LogSink.warn(
@@ -124,22 +170,47 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     LogSink.warn('No review-enabled models configured — PR review and fixes are disabled.', TraceTags.PI);
   }
 
-  const multiValidator = new MultiModelValidator(validators);
-  // Info-gatherer runs once per PR before validation, asking the first available
-  // validator what extra files/symbols would help judge the findings.
-  const infoGatherer = new InfoGatherer(validators[0] ?? null, maxInfoTokens);
+  const implementModelSlot = config.get('Implement.ModelSlot');
+  const implementSlotKey =
+    implementModelSlot >= 1 && implementModelSlot <= modelKeys.length ? modelKeys[implementModelSlot - 1] : null;
+  const implementSlotModel = implementSlotKey ? buildReviewModel(implementSlotKey) : null;
+  if (implementModelSlot > 0 && !implementSlotModel) {
+    LogSink.warn(
+      `IMPLEMENT_MODEL_SLOT=${implementModelSlot} is not a review-enabled model ` +
+        `(needs MODEL${implementModelSlot}_REVIEW=true plus key/base/model) — ` +
+        `falling back to the first review-enabled model for ticket implementation.`,
+      TraceTags.PI,
+    );
+  }
+  const implementModel = implementSlotModel ?? reviewModels[0] ?? null;
+
+  const multiValidator = new MultiModelValidator(validators, judgeModel, alwaysJudge);
+  LogSink.debug(
+    `Round-2 judge: ${judgeModel ? judgeModel.name : '(first available validator)'}` +
+      `${alwaysJudge ? ' — always-on (every finding is judged, not just split votes)' : ''}`,
+    TraceTags.DEBUG,
+  );
+  // Info-gatherer runs once per PR before validation, asking the aux model
+  // (see above) what extra files/symbols would help judge the findings.
+  const infoGatherer = new InfoGatherer(auxModel, maxInfoTokens, auxFallbackModel, auxMaxConcurrency);
   if (infoGatherer.isEnabled) {
-    LogSink.debug(`Info gatherer: ${validators[0].name} (budget ${maxInfoTokens} tokens)`, TraceTags.DEBUG);
+    LogSink.debug(
+      `Info gatherer: ${auxModel!.name}${auxFallbackModel ? ` (fallback: ${auxFallbackModel.name})` : ''} (budget ${maxInfoTokens} tokens)`,
+      TraceTags.DEBUG,
+    );
   } else {
     LogSink.debug(`Info gatherer: disabled (no validator or MaxInfoTokens=0)`, TraceTags.DEBUG);
   }
 
   // Context explorer runs once per PR before the review pass, walking the repo
   // from the diff (callers, type definitions) so the tool-less reviewers get
-  // cross-file context. Uses the first available validator, like the gatherer.
-  const contextExplorer = new ContextExplorer(validators[0] ?? null, maxExplorationTokens);
+  // cross-file context. Uses the aux model, like the gatherer.
+  const contextExplorer = new ContextExplorer(auxModel, maxExplorationTokens, auxFallbackModel);
   if (contextExplorer.isEnabled) {
-    LogSink.debug(`Context explorer: ${validators[0].name} (budget ${maxExplorationTokens} tokens)`, TraceTags.DEBUG);
+    LogSink.debug(
+      `Context explorer: ${auxModel!.name}${auxFallbackModel ? ` (fallback: ${auxFallbackModel.name})` : ''} (budget ${maxExplorationTokens} tokens)`,
+      TraceTags.DEBUG,
+    );
   } else {
     LogSink.debug(`Context explorer: disabled (no validator or MaxExplorationTokens=0)`, TraceTags.DEBUG);
   }
@@ -148,11 +219,20 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
   const securityScanner = new SecurityScanner(securityScannersEnabled);
   LogSink.debug(`Security scanner: ${securityScanner.isEnabled ? 'enabled' : 'disabled'}`, TraceTags.DEBUG);
 
-  // Finding deduplicator: a single LLM (the first validator) collapses same-run
+  // Finding deduplicator: a single LLM (the aux model) collapses same-run
   // duplicate findings before the validation council sees them.
-  const deduplicator = new FindingDeduplicator(validators[0] ?? null);
+  const deduplicator = new FindingDeduplicator(auxModel, auxFallbackModel, auxMaxConcurrency);
   LogSink.debug(
-    `Finding deduplicator: ${deduplicator.isEnabled ? validators[0].name : 'disabled (no validator)'}`,
+    `Finding deduplicator: ${deduplicator.isEnabled ? auxModel!.name : 'disabled (no validator)'}`,
+    TraceTags.DEBUG,
+  );
+
+  // Failure explainer: turns a final-attempt auto-review failure into a
+  // plain-language PR comment instead of a raw error. Same aux model/fallback
+  // pair as the other single-model helper roles above.
+  const failureExplainer = new FailureExplainer(auxModel, auxFallbackModel);
+  LogSink.debug(
+    `Failure explainer: ${failureExplainer.isEnabled ? auxModel!.name : 'disabled (no validator) — failure comments show the raw error only'}`,
     TraceTags.DEBUG,
   );
 
@@ -226,7 +306,23 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     securityScanner,
     jiraService,
     heartbeat,
+    failureExplainer,
   );
+
+  const ticketService = new TicketService({
+    provider,
+    git: gitService,
+    jira: jiraService,
+    state: stateService,
+    carrotConfig: carrotConfigService,
+    implementModel,
+    multiValidator,
+    maxValidators,
+    repoPicker: new RepoPicker(auxModel, auxFallbackModel),
+    failureExplainer,
+    heartbeat,
+  });
+  const ticketsEnabled = await ticketService.init();
 
   const poller = new PollerService(
     provider,
@@ -238,12 +334,14 @@ export async function buildAndStart(input: IBootstrapInput): Promise<void> {
     botUsername,
     intervalMs,
     heartbeat,
+    ticketsEnabled ? ticketService : null,
   );
 
   const shutdown = (): void => {
     LogSink.info('Shutdown signal received...', TraceTags.DEBUG);
     poller.shutdown();
-    process.exit(0);
+    // process.exit drops the telemetry that is not exported yet
+    void shutdownInstrumentation().finally(() => process.exit(0));
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
